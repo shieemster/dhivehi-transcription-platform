@@ -1,5 +1,5 @@
 'use client'
-export const dynamic = 'force-dynamic'
+import { Suspense } from 'react'
 import * as React from "react";
 const { useState, useEffect } = React;
 import { useRouter, useSearchParams } from "next/navigation";
@@ -12,6 +12,14 @@ import { Slider } from "@/components/ui/slider";
 import { Upload, FileText, X, Moon, Sun, Check } from "lucide-react";
 import { useTheme } from "next-themes";
 import { BACKEND_URL } from "@/config";
+
+export default function NewTranscript() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-stone-200 dark:bg-neutral-900 animate-pulse" />}>
+      <NewTranscriptPage />
+    </Suspense>
+  );
+}
 
 export function ThemeToggle() {
   const { theme, setTheme } = useTheme();
@@ -56,7 +64,7 @@ const categories = [
   { value: "other", label: "Other" },
 ];
 
-export default function NewTranscript() {
+function NewTranscriptPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const jobId = searchParams.get('job_id');

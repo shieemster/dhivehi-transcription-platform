@@ -1,4 +1,5 @@
 'use client'
+import { Suspense } from 'react'
 import * as React from "react";
 const { useState, useEffect, useRef } = React;
 import { useRouter, useSearchParams } from "next/navigation";
@@ -25,9 +26,20 @@ import {
   Loader2,
   Check,
   Sparkles,
-  ChevronDown
+  FileDown
 } from "lucide-react";
 import { useTheme } from "next-themes";
+import PdfExportModal from "@/components/PdfExportModal";
+import { generateTranscriptPdf } from "@/lib/pdfGenerator";
+import type { PdfAnalysisData } from "@/lib/pdfGenerator";
+
+export default function TranscriptDetails() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-stone-200 dark:bg-neutral-900 animate-pulse" />}>
+      <TranscriptDetailsPage />
+    </Suspense>
+  );
+}
 
 export function ThemeToggle() {
   const { theme, setTheme } = useTheme();
@@ -88,7 +100,7 @@ interface ParentTranscript {
   local_path?: string;
 }
 
-export default function TranscriptDetails() {
+function TranscriptDetailsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const jobId = searchParams.get('job_id');
@@ -108,15 +120,10 @@ export default function TranscriptDetails() {
   const saveTimeouts = useRef<{ [key: string]: NodeJS.Timeout }>({});
   const saveLocks = useRef<Set<string>>(new Set());
 
-  const [analysing, setAnalysing] = useState(false);
-  const [analysisResult, setAnalysisResult] = useState<{
-    keywords: string[];
-    entities: { persons: string[]; locations: string[]; organizations: string[]; events: string[] };
-    summary: string;
-    classification: string;
-    english_translation: string;
-  } | null>(null);
-  const [showTranslation, setShowTranslation] = useState(false);
+  const [exportModalOpen, setExportModalOpen] = useState(false);
+  const [exportFormat, setExportFormat] = useState<'segmented' | 'paragraph'>('segmented');
+  const [exportLoading, setExportLoading] = useState(false);
+  const [analysisPdfData, setAnalysisPdfData] = useState<PdfAnalysisData | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -200,12 +207,11 @@ export default function TranscriptDetails() {
       });
 
       if (parentPayload.analysis_status === "complete") {
-        setAnalysisResult({
+        setAnalysisPdfData({
+          summary: parentPayload.analysis_summary || "",
           keywords: parentPayload.analysis_keywords || [],
           entities: parentPayload.analysis_entities || { persons: [], locations: [], organizations: [], events: [] },
-          summary: parentPayload.analysis_summary || "",
           classification: parentPayload.analysis_classification || "",
-          english_translation: parentPayload.analysis_english_translation || "",
         });
       }
 
@@ -609,45 +615,32 @@ export default function TranscriptDetails() {
     }
   };
 
-  const handleAnalyse = async () => {
-    if (!jobId) return;
-    setAnalysing(true);
+  const handleGeneratePdf = async (format: 'segmented' | 'paragraph') => {
+    if (!parent) return;
+    setExportLoading(true);
     try {
-      const resp = await fetch(`${BACKEND_URL}/transcripts/${jobId}/analyse`, {
-        method: 'POST',
+      await generateTranscriptPdf({
+        parent: {
+          filename: parent.filename,
+          reference_number: parent.reference_number,
+          category: parent.category,
+          status: parent.status,
+          timestamp: parent.timestamp,
+        },
+        segments: segments.map(s => ({
+          speaker: s.speaker,
+          start_time: s.start_time,
+          end_time: s.end_time,
+          transcript_text: editedTexts[s.id] || s.transcript_text,
+          segment_index: s.segment_index,
+        })),
+        format,
+        analysisData: analysisPdfData,
       });
-      if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}));
-        throw new Error(errData.error || `Analysis failed: ${resp.status}`);
-      }
-      const data = await resp.json();
-      setAnalysisResult({
-        keywords: data.keywords || [],
-        entities: data.entities || { persons: [], locations: [], organizations: [], events: [] },
-        summary: data.summary || "",
-        classification: data.classification || "",
-        english_translation: data.english_translation || "",
-      });
-    } catch (err) {
-      console.error("Analysis failed:", err);
-      alert(`Analysis failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+      setExportModalOpen(false);
     } finally {
-      setAnalysing(false);
+      setExportLoading(false);
     }
-  };
-
-  const getClassificationColor = (classification: string) => {
-    switch (classification) {
-      case "threat": return "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200";
-      case "alibi": return "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200";
-      case "emergency": return "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200";
-      case "general_discussion": return "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200";
-      default: return "bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-200";
-    }
-  };
-
-  const formatClassification = (classification: string) => {
-    return classification.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
   };
 
   if (!mounted || loading) {
@@ -735,20 +728,26 @@ export default function TranscriptDetails() {
                 </Badge>
               </div>
               <div className="flex items-center gap-2">
-                {parent.status === "transcribed" && !analysisResult && (
+                {parent.status === "transcribed" && (
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={handleAnalyse}
-                    disabled={analysing}
-                    className="bg-stone-50 hover:bg-stone-200 dark:bg-neutral-700 dark:hover:bg-neutral-600 transition-all duration-300 hover:scale-105 disabled:opacity-50"
+                    onClick={() => router.push(`/Transcripts/Analysis?job_id=${jobId}`)}
+                    className="bg-stone-50 hover:bg-stone-200 dark:bg-neutral-700 dark:hover:bg-neutral-600 transition-all duration-300 hover:scale-105"
                   >
-                    {analysing ? (
-                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                    ) : (
-                      <Sparkles className="w-4 h-4 mr-2" />
-                    )}
-                    {analysing ? "Analysing..." : "Analyse"}
+                    <Sparkles className="w-4 h-4 mr-2" />
+                    Analyse
+                  </Button>
+                )}
+                {segments.length > 0 && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setExportModalOpen(true)}
+                    className="bg-stone-50 hover:bg-stone-200 dark:bg-neutral-700 dark:hover:bg-neutral-600 transition-all duration-300 hover:scale-105"
+                  >
+                    <FileDown className="w-4 h-4 mr-2" />
+                    Export PDF
                   </Button>
                 )}
                 <Button
@@ -928,89 +927,12 @@ export default function TranscriptDetails() {
           </CardContent>
         </Card>
 
-        {analysisResult && (
-          <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700 mt-6 transition-all duration-500 ease-in-out">
-            <CardHeader>
-              <CardTitle className="text-xl text-neutral-900 dark:text-white flex items-center gap-2">
-                <Sparkles className="w-5 h-5" />
-                Analysis Results
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              <div>
-                <h4 className="font-semibold text-neutral-900 dark:text-white mb-2">Summary</h4>
-                <p className="text-stone-700 dark:text-neutral-300 leading-relaxed">
-                  {analysisResult.summary}
-                </p>
-              </div>
-
-              {analysisResult.keywords.length > 0 && (
-                <div>
-                  <h4 className="font-semibold text-neutral-900 dark:text-white mb-2">Keywords</h4>
-                  <div className="flex flex-wrap gap-2">
-                    {analysisResult.keywords.map((kw, i) => (
-                      <Badge key={i} className="bg-stone-600 dark:bg-neutral-600 text-white">
-                        {kw}
-                      </Badge>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {analysisResult.entities && (
-                <div>
-                  <h4 className="font-semibold text-neutral-900 dark:text-white mb-2">Named Entities</h4>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    {Object.entries(analysisResult.entities).map(([type, items]) =>
-                      Array.isArray(items) && items.length > 0 ? (
-                        <div key={type} className="p-3 bg-stone-50 dark:bg-neutral-700/50 rounded-lg">
-                          <p className="text-xs font-semibold text-stone-500 dark:text-neutral-400 uppercase mb-2">
-                            {type}
-                          </p>
-                          <div className="flex flex-wrap gap-1.5">
-                            {items.map((item: string, i: number) => (
-                              <Badge key={i} variant="outline" className="text-stone-700 dark:text-neutral-300 border-stone-300 dark:border-neutral-600">
-                                {item}
-                              </Badge>
-                            ))}
-                          </div>
-                        </div>
-                      ) : null
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {analysisResult.classification && (
-                <div>
-                  <h4 className="font-semibold text-neutral-900 dark:text-white mb-2">Classification</h4>
-                  <Badge className={`${getClassificationColor(analysisResult.classification)} font-medium`}>
-                    {formatClassification(analysisResult.classification)}
-                  </Badge>
-                </div>
-              )}
-
-              {analysisResult.english_translation && (
-                <div>
-                  <button
-                    onClick={() => setShowTranslation(!showTranslation)}
-                    className="flex items-center gap-2 text-sm font-semibold text-stone-600 dark:text-neutral-400 hover:text-stone-800 dark:hover:text-neutral-200 transition-colors"
-                  >
-                    {showTranslation ? "Hide" : "Show"} English Translation
-                    <ChevronDown className={`w-4 h-4 transition-transform ${showTranslation ? "rotate-180" : ""}`} />
-                  </button>
-                  {showTranslation && (
-                    <div className="mt-2 p-4 bg-stone-50 dark:bg-neutral-700/50 rounded-lg">
-                      <p className="text-stone-700 dark:text-neutral-300 leading-relaxed whitespace-pre-wrap">
-                        {analysisResult.english_translation}
-                      </p>
-                    </div>
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        )}
+        <PdfExportModal
+          open={exportModalOpen}
+          onClose={() => setExportModalOpen(false)}
+          onGenerate={handleGeneratePdf}
+          loading={exportLoading}
+        />
       </main>
     </div>
   );

@@ -68,3 +68,11 @@ mock_workers/
 
 # Gradio outputs (if generated data)
 gradio/analysis/outputs/
+
+# TLS certs/keys — locally generated per-deployment, never committed.
+# (minio-certs/private.key and backend-certs/private.key were previously
+# committed and pushed to this public repo — rotated after discovery; see
+# project memory for details. Regenerate with openssl, don't recommit.)
+minio-certs/
+backend-certs/
+*.key

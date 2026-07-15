@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -12,7 +13,7 @@ import (
 )
 
 // canAccessTranscript centralizes the "does this caller have permission
-// to touch this specific transcript" check, so GetFileURL, delete,
+// to touch this specific transcript" check, so GetFile, delete,
 // segment reads, and segment edits all use identical logic instead of
 // four separately-maintained copies that could quietly drift apart.
 func canAccessTranscript(claims *services.Claims, grantedSet map[string]bool, uploadedBy string) bool {
@@ -23,6 +24,18 @@ func canAccessTranscript(claims *services.Claims, grantedSet map[string]bool, up
 		return uploadedBy == claims.UserID
 	}
 	return false
+}
+
+// logAccessDenied records an authenticated caller being blocked by
+// canAccessTranscript's ownership check — distinct from an RBAC-level 403
+// (no matching permission at all, which never reaches a handler), this is
+// specifically "you have some access to transcripts, but not this one",
+// which is exactly the kind of attempted-overreach an audit log exists to
+// surface.
+func logAccessDenied(c *gin.Context, claims *services.Claims, resourceType, resourceID, action string) {
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "access_denied", resourceType, resourceID, c.ClientIP(), map[string]interface{}{"attempted_action": action}); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
 }
 
 // ListTranscripts handles GET /transcripts and GET /transcripts?status=completed
@@ -94,7 +107,7 @@ func TranscriptStats(c *gin.Context) {
 
 // DeleteTranscriptHandler handles DELETE /transcripts/:job_id.
 // Requires transcript:delete (currently administrator-only per the seeded
-// role permissions). Still checks ownership the same way GetFileURL does,
+// role permissions). Still checks ownership the same way GetFile does,
 // so if a future role gets delete without view_all, it stays scoped to
 // their own records rather than silently deleting everything.
 func DeleteTranscriptHandler(c *gin.Context) {
@@ -109,6 +122,7 @@ func DeleteTranscriptHandler(c *gin.Context) {
 	}
 
 	if !canAccessTranscript(claims, grantedSet, transcript.UploadedBy) {
+		logAccessDenied(c, claims, "transcript", jobID, "DeleteTranscriptHandler")
 		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to delete this transcript"})
 		return
 	}
@@ -116,6 +130,10 @@ func DeleteTranscriptHandler(c *gin.Context) {
 	if err := services.DeleteTranscript(jobID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to delete transcript: %v", err)})
 		return
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "transcript_delete", "transcript", jobID, c.ClientIP(), map[string]interface{}{"filename": transcript.Filename}); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "transcript deleted"})
@@ -191,6 +209,7 @@ func UpdateSegment(c *gin.Context) {
 		return
 	}
 	if !canAccessTranscript(claims, grantedSet, transcript.UploadedBy) {
+		logAccessDenied(c, claims, "transcript", jobID, "UpdateSegment")
 		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to edit this transcript"})
 		return
 	}
@@ -206,13 +225,18 @@ func UpdateSegment(c *gin.Context) {
 		return
 	}
 
+	segmentResource := fmt.Sprintf("%s_seg_%03d", jobID, segmentIndex)
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "segment_edit", "segment", segmentResource, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"message": "segment updated"})
 }
 
-// GetSegmentAudioURL handles GET /transcripts/:job_id/segments/:segment_index/audio-url
-// — same presigned-URL pattern as GetFileURL, but for an individual
-// segment's audio clip rather than the parent recording.
-func GetSegmentAudioURL(c *gin.Context) {
+// GetSegmentAudio handles GET /transcripts/:job_id/segments/:segment_index/audio
+// — streams the decrypted audio bytes directly, same approach as GetFile,
+// for an individual segment's audio clip rather than the parent recording.
+func GetSegmentAudio(c *gin.Context) {
 	jobID := c.Param("job_id")
 	claims := c.MustGet("claims").(*services.Claims)
 	grantedSet := c.MustGet("permissions").(map[string]bool)
@@ -229,6 +253,7 @@ func GetSegmentAudioURL(c *gin.Context) {
 		return
 	}
 	if !canAccessTranscript(claims, grantedSet, transcript.UploadedBy) {
+		logAccessDenied(c, claims, "transcript", jobID, "GetSegmentAudio")
 		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to access this transcript"})
 		return
 	}
@@ -255,14 +280,26 @@ func GetSegmentAudioURL(c *gin.Context) {
 		return
 	}
 
-	url, err := services.GeneratePresignedURL(c.Request.Context(), target.MinioBucket, target.MinioObject, fileURLExpiry)
+	obj, info, err := services.StreamObject(c.Request.Context(), target.MinioBucket, target.MinioObject)
 	if err != nil {
-		log.Printf("⚠️ presign failed for segment %s/%s: %v", target.MinioBucket, target.MinioObject, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate audio URL"})
+		log.Printf("⚠️ stream failed for segment %s/%s: %v", target.MinioBucket, target.MinioObject, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve audio"})
 		return
 	}
+	defer obj.Close()
 
-	c.JSON(http.StatusOK, gin.H{"url": url, "expires_in": int(fileURLExpiry.Seconds())})
+	segmentResource := fmt.Sprintf("%s_seg_%03d", jobID, segmentIndex)
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "segment_audio_access", "segment", segmentResource, c.ClientIP(), map[string]interface{}{"speaker": target.Speaker}); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.Header("Content-Type", "audio/wav")
+	c.Header("Content-Length", fmt.Sprintf("%d", info.Size))
+	c.Status(http.StatusOK)
+
+	if _, err := io.Copy(c.Writer, obj); err != nil {
+		log.Printf("⚠️ error streaming segment audio to client: %v", err)
+	}
 }
 
 // GetStatsHandler handles GET /api/stats

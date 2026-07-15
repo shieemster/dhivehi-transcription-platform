@@ -136,6 +136,7 @@ function TranscriptDetailsPage() {
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const audioObjectUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     setMounted(true);
@@ -158,6 +159,10 @@ function TranscriptDetailsPage() {
       }
       if (progressIntervalRef.current) {
         clearInterval(progressIntervalRef.current);
+      }
+      if (audioObjectUrlRef.current) {
+        URL.revokeObjectURL(audioObjectUrlRef.current);
+        audioObjectUrlRef.current = null;
       }
       Object.values(saveTimeouts.current).forEach(timeout => clearTimeout(timeout));
     };
@@ -201,7 +206,7 @@ function TranscriptDetailsPage() {
         speaker: s.speaker,
         start_time: s.start_time,
         end_time: s.end_time,
-        minio_url: '', // no longer used directly — playback goes through the audio-url endpoint
+        minio_url: '', // no longer used directly — playback fetches the audio endpoint as a blob
         transcript_text: s.transcript_text || 'Transcription pending...',
         embedding_generated: s.embedding_generated,
         timestamp: s.timestamp,
@@ -319,39 +324,53 @@ function TranscriptDetailsPage() {
     }
   };
 
-  const handlePlayPause = async (segment: Segment) => {
-    if (playingSegment === segment.id) {
-      if (audioRef.current) {
-        audioRef.current.pause();
-      }
-      if (progressIntervalRef.current) {
-        clearInterval(progressIntervalRef.current);
-      }
-      setPlayingSegment(null);
-      setAudioProgress({});
-      return;
-    }
-
+  const stopAudio = () => {
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
     }
     if (progressIntervalRef.current) {
       clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
     }
+    if (audioObjectUrlRef.current) {
+      URL.revokeObjectURL(audioObjectUrlRef.current);
+      audioObjectUrlRef.current = null;
+    }
+  };
+
+  const handlePlayPause = async (segment: Segment) => {
+    if (playingSegment === segment.id) {
+      stopAudio();
+      setPlayingSegment(null);
+      setAudioProgress({});
+      return;
+    }
+
+    stopAudio();
     setAudioProgress({});
 
     try {
       setAudioLoading(segment.id);
       setAudioProgress({ [segment.id]: 0 });
 
-      const { url: accessibleUrl } = await apiFetch<{ url: string }>(
-        authFetch,
-        `${BACKEND_URL}/transcripts/${jobId}/segments/${segment.segment_index}/audio-url`
+      // The segment audio is encrypted at rest (SSE-C) and can no longer be
+      // handed out as a presigned URL — the backend streams the decrypted
+      // bytes directly, so we fetch them as a blob and play from an object
+      // URL instead of pointing <audio> at a remote URL.
+      const response = await authFetch(
+        `${BACKEND_URL}/transcripts/${jobId}/segments/${segment.segment_index}/audio`
       );
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `Failed to load audio (${response.status})`);
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      audioObjectUrlRef.current = objectUrl;
 
       const audio = new Audio();
-      audio.src = accessibleUrl;
+      audio.src = objectUrl;
       audioRef.current = audio;
 
       const segmentDuration = segment.end_time - segment.start_time;
@@ -384,10 +403,7 @@ function TranscriptDetailsPage() {
 
       audio.addEventListener('ended', () => {
         setPlayingSegment(null);
-        audioRef.current = null;
-        if (progressIntervalRef.current) {
-          clearInterval(progressIntervalRef.current);
-        }
+        stopAudio();
         setAudioProgress({});
       });
 
@@ -417,10 +433,7 @@ function TranscriptDetailsPage() {
 
         setAudioLoading(null);
         setPlayingSegment(null);
-        audioRef.current = null;
-        if (progressIntervalRef.current) {
-          clearInterval(progressIntervalRef.current);
-        }
+        stopAudio();
         setAudioProgress({});
       });
 
@@ -432,9 +445,7 @@ function TranscriptDetailsPage() {
       alert(`Failed to play audio: ${error instanceof Error ? error.message : 'Unknown error'}`);
       setAudioLoading(null);
       setPlayingSegment(null);
-      if (progressIntervalRef.current) {
-        clearInterval(progressIntervalRef.current);
-      }
+      stopAudio();
       setAudioProgress({});
     }
   };
@@ -487,10 +498,25 @@ function TranscriptDetailsPage() {
   const handleDownload = async () => {
     if (!jobId) return;
     try {
-      const { url } = await apiFetch<{ url: string }>(authFetch, `${BACKEND_URL}/files/${jobId}`);
-      window.open(url, "_blank");
+      // Encrypted at rest (SSE-C) — the backend streams the decrypted file
+      // directly rather than handing out a presigned URL, so fetch it as a
+      // blob and trigger the download client-side.
+      const response = await authFetch(`${BACKEND_URL}/files/${jobId}`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `Failed to download (${response.status})`);
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = parent?.filename || "download";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
     } catch (err) {
-      console.error('Failed to get download URL:', err);
+      console.error('Failed to download file:', err);
       alert(err instanceof Error ? err.message : 'Failed to prepare download');
     }
   };

@@ -99,7 +99,6 @@ func GetUserPermissions(ctx context.Context, roleID int16) ([]string, error) {
 	return perms, rows.Err()
 }
 
-
 func GetPermissionsByRoleName(ctx context.Context, roleName string) ([]string, error) {
 	rows, err := DB.Query(ctx, `
 		SELECT p.code FROM role_permissions rp
@@ -123,6 +122,38 @@ func GetPermissionsByRoleName(ctx context.Context, roleName string) ([]string, e
 	return perms, rows.Err()
 }
 
+type RoleUserCount struct {
+	RoleName  string `json:"role_name"`
+	UserCount int64  `json:"user_count"`
+}
+
+// GetRoleUserCounts returns how many active users are assigned to each of
+// the four seeded roles — the RBAC breakdown shown on the security
+// dashboard. Roles with zero users still appear (LEFT JOIN), so an admin
+// can see at a glance that, say, no one has the "supervisor" role yet.
+func GetRoleUserCounts(ctx context.Context) ([]RoleUserCount, error) {
+	rows, err := DB.Query(ctx, `
+		SELECT r.name, count(u.id) FILTER (WHERE u.is_active)
+		FROM roles r
+		LEFT JOIN users u ON u.role_id = r.id
+		GROUP BY r.name
+		ORDER BY r.name
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch role user counts: %w", err)
+	}
+	defer rows.Close()
+
+	var counts []RoleUserCount
+	for rows.Next() {
+		var rc RoleUserCount
+		if err := rows.Scan(&rc.RoleName, &rc.UserCount); err != nil {
+			return nil, err
+		}
+		counts = append(counts, rc)
+	}
+	return counts, rows.Err()
+}
 
 func isUniqueViolation(err error) bool {
 	// pgx wraps *pgconn.PgError; code 23505 = unique_violation.

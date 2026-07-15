@@ -1,12 +1,16 @@
 import os
 import time
 import json
+import base64
 import requests
 import redis
 import tempfile
 import subprocess
+import urllib3
 from datetime import datetime
 from minio import Minio
+from minio.credentials import StaticProvider
+from minio.sse import SseCustomerKey
 
 # =========================
 # Environment & Setup
@@ -21,17 +25,37 @@ r = redis.Redis(
     socket_timeout=None,
 )
 
-# MinIO connection
+# MinIO connection — TLS-only (required for SSE-C: the decryption key
+# travels as an HTTP header and must never go over plain HTTP). The cert is
+# self-signed for local dev, so rather than disabling verification we pin
+# trust to this specific cert, same approach as the Go backend.
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio123")
+MINIO_CERT_PATH = os.getenv("MINIO_CERT_PATH", "/app/certs/public.crt")
 
-from minio.credentials import StaticProvider
+_minio_http_client = urllib3.PoolManager(
+    cert_reqs="CERT_REQUIRED",
+    ca_certs=MINIO_CERT_PATH,
+)
+
 minio_client = Minio(
     MINIO_ENDPOINT,
     credentials=StaticProvider(MINIO_ACCESS_KEY, MINIO_SECRET_KEY),
-    secure=False
+    secure=True,
+    http_client=_minio_http_client,
 )
+
+# SSE-C key — same 32-byte AES-256 key (base64-encoded in the env) that the
+# Go backend uses, so objects encrypted by one side can be decrypted by the
+# other.
+_sse_c_key_b64 = os.getenv("SSE_C_KEY", "")
+if not _sse_c_key_b64:
+    raise EnvironmentError("Missing SSE_C_KEY.")
+_sse_c_key_bytes = base64.b64decode(_sse_c_key_b64)
+if len(_sse_c_key_bytes) != 32:
+    raise EnvironmentError(f"SSE_C_KEY must decode to exactly 32 bytes (AES-256), got {len(_sse_c_key_bytes)}")
+sse_c = SseCustomerKey(_sse_c_key_bytes)
 
 print("✅ Connected to MinIO and Redis")
 
@@ -43,10 +67,10 @@ def download_from_minio_url(minio_url: str) -> bytes:
     the stored URL will always return 403. This parses "bucket/object" out
     of the URL and downloads it the same way the backend does internally.
     """
-    # minio_url looks like: http://minio:9000/<bucket>/<object_name>
+    # minio_url looks like: https://minio:9000/<bucket>/<object_name>
     path = minio_url.split(f"{MINIO_ENDPOINT}/", 1)[-1]
     bucket, object_name = path.split("/", 1)
-    response = minio_client.get_object(bucket, object_name)
+    response = minio_client.get_object(bucket, object_name, ssec=sse_c)
     try:
         return response.read()
     finally:
@@ -173,10 +197,11 @@ def process_file(file_id, minio_url, filename):
             bucket,
             audio_filename,
             audio_path,
-            content_type="audio/wav"
+            content_type="audio/wav",
+            sse=sse_c
         )
-        
-        new_minio_url = f"http://{MINIO_ENDPOINT}/{bucket}/{audio_filename}"
+
+        new_minio_url = f"https://{MINIO_ENDPOINT}/{bucket}/{audio_filename}"
         print(f"✅ Uploaded: {new_minio_url}")
         
         # Clean up temp files

@@ -4,7 +4,7 @@ const { useState, useEffect } = React;
 import { useRouter } from "next/navigation";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Upload, List, Moon, Sun, Loader2, LogOut } from "lucide-react";
+import { Upload, List, Moon, Sun, Loader2, LogOut, ShieldCheck } from "lucide-react";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
 
@@ -127,6 +127,17 @@ export default function TranscriptionApp() {
               <span className={`text-sm hidden sm:inline ${isDark ? 'text-neutral-300' : 'text-neutral-600'}`}>
                 {user.display_name} · <span className="capitalize">{user.role}</span>
               </span>
+            )}
+            {user?.role === 'administrator' && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => (window.location.href = "/Security")}
+                title="Security Dashboard"
+                className="transition-all duration-300 ease-in-out hover:scale-110"
+              >
+                <ShieldCheck className={`h-5 w-5 ${isDark ? 'text-neutral-300' : 'text-neutral-700'}`} />
+              </Button>
             )}
             <Button
               variant="ghost"

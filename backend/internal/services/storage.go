@@ -2,80 +2,64 @@ package services
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
-	"net/url"
+	"io"
 	"os"
-	"time"
 
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/encrypt"
 )
 
-// presignClient is a SEPARATE MinIO client used only to generate presigned
-// URLs, configured with a browser-reachable endpoint (MINIO_PUBLIC_ENDPOINT,
-// e.g. "localhost:9000") instead of the internal Docker network hostname
-// ("minio:9000") that MinioClient itself uses.
+// SSE returns the server-side-encryption-with-customer-key (SSE-C) config
+// used for every object read/write against MinIO. AES-256 at rest works
+// like this: the key never leaves the backend (never sent to the browser,
+// never stored anywhere but this env var + MinIO's in-memory use of it per
+// request) — MinIO does the actual AES-256-GCM encrypt/decrypt using this
+// key on every PutObject/GetObject call we make.
 //
-// Why two clients: MinioClient talks to MinIO over the internal Docker
-// network for actual uploads/downloads done BY the backend — "minio:9000"
-// is correct and required there. But a presigned URL is handed to the
-// BROWSER, which has no idea what "minio" is (that hostname only resolves
-// inside the Docker network) — every presigned URL generated with the
-// internal client would fail to load with a generic, confusing error.
-// Presigning is a pure client-side signing operation (no network call), so
-// this second client doesn't need to actually be reachable from inside the
-// backend container at all — it only needs the correct public-facing
-// endpoint baked into the URLs it produces.
-var presignClient *minio.Client
-
-func initPresignClient() error {
-	publicEndpoint := os.Getenv("MINIO_PUBLIC_ENDPOINT")
-	if publicEndpoint == "" {
-		publicEndpoint = "localhost:9000"
+// This is why file access changed from "hand the browser a presigned link"
+// to "the backend fetches+decrypts and streams the bytes itself": SSE-C's
+// key must be sent as an HTTP header, and a presigned URL only carries
+// query-string auth — there's no way for a plain browser GET (or an
+// <audio src>) to attach that header. The backend is now the only thing
+// that ever talks to MinIO directly.
+func SSE() (encrypt.ServerSide, error) {
+	keyB64 := os.Getenv("SSE_C_KEY")
+	if keyB64 == "" {
+		return nil, fmt.Errorf("SSE_C_KEY is not set")
 	}
-	accessKey := os.Getenv("MINIO_ACCESS_KEY")
-	if accessKey == "" {
-		accessKey = "minio"
+	key, err := base64.StdEncoding.DecodeString(keyB64)
+	if err != nil {
+		return nil, fmt.Errorf("SSE_C_KEY is not valid base64: %w", err)
 	}
-	secretKey := os.Getenv("MINIO_SECRET_KEY")
-	if secretKey == "" {
-		secretKey = "minio123"
+	if len(key) != 32 {
+		return nil, fmt.Errorf("SSE_C_KEY must decode to exactly 32 bytes (AES-256), got %d", len(key))
 	}
-
-	var err error
-	presignClient, err = minio.New(publicEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: false,
-		// Without an explicit region, minio-go tries to auto-detect it by
-		// calling GetBucketLocation — a real network request made using
-		// THIS client's own endpoint (localhost:9000). Since this code runs
-		// inside the backend container, "localhost" means the container
-		// itself, which has nothing listening on 9000 — that lookup then
-		// fails with "connection refused" before presigning ever happens.
-		// Setting the region explicitly (matches MinIO's default) skips
-		// that lookup entirely, since presigning itself is pure local
-		// signing and needs no network access at all.
-		Region: "us-east-1",
-	})
-	return err
+	return encrypt.NewSSEC(key)
 }
 
-// GeneratePresignedURL returns a time-limited, signed URL for a private
-// MinIO object. This replaces the old public-read bucket policy — instead
-// of anyone being able to guess/reuse a permanent object URL, callers must
-// go through GET /files/:job_id (which checks RBAC + ownership) to obtain
-// one of these, and it stops working after expiry.
-func GeneratePresignedURL(ctx context.Context, bucket, objectName string, expiry time.Duration) (string, error) {
-	if presignClient == nil {
-		if err := initPresignClient(); err != nil {
-			return "", fmt.Errorf("failed to initialize presign client: %w", err)
-		}
+// StreamObject fetches and decrypts an object from MinIO, returning a
+// reader the caller can copy directly to an HTTP response, plus its
+// content type and size for setting response headers.
+func StreamObject(ctx context.Context, bucket, objectName string) (io.ReadCloser, minio.ObjectInfo, error) {
+	sse, err := SSE()
+	if err != nil {
+		return nil, minio.ObjectInfo{}, err
 	}
 
-	reqParams := url.Values{}
-	presignedURL, err := presignClient.PresignedGetObject(ctx, bucket, objectName, expiry, reqParams)
+	obj, err := MinioClient.GetObject(ctx, bucket, objectName, minio.GetObjectOptions{
+		ServerSideEncryption: sse,
+	})
 	if err != nil {
-		return "", fmt.Errorf("failed to generate presigned URL: %w", err)
+		return nil, minio.ObjectInfo{}, fmt.Errorf("failed to get object: %w", err)
 	}
-	return presignedURL.String(), nil
+
+	info, err := obj.Stat()
+	if err != nil {
+		obj.Close()
+		return nil, minio.ObjectInfo{}, fmt.Errorf("failed to stat object (check SSE_C_KEY matches what it was uploaded with): %w", err)
+	}
+
+	return obj, info, nil
 }

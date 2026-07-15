@@ -1,0 +1,15 @@
+{
+	auto_https off
+}
+
+:8000 {
+	tls /certs/public.crt /certs/private.key
+
+	reverse_proxy backend:8000
+}
+
+:3443 {
+	tls /certs/public.crt /certs/private.key
+
+	reverse_proxy frontend:3000
+}

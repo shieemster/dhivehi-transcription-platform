@@ -36,6 +36,8 @@ services:
       - "9001:9001"
     volumes:
       - minio_data:/data
+      - ./minio-certs/public.crt:/root/.minio/certs/public.crt:ro
+      - ./minio-certs/private.key:/root/.minio/certs/private.key:ro
     networks:
       - app_network
 
@@ -72,8 +74,11 @@ services:
       MINIO_ENDPOINT: "minio:9000"
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
+      SSE_C_KEY: "${SSE_C_KEY}"
       DAGSTER_ENABLED: "true"
       DAGSTER_API_URL: "http://dagster:3000"
+    volumes:
+      - ./minio-certs/public.crt:/app/certs/public.crt:ro
     networks:
       - app_network
 
@@ -94,12 +99,14 @@ services:
       MINIO_ENDPOINT: "minio:9000"
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
+      SSE_C_KEY: "${SSE_C_KEY}"
       DAGSTER_ENABLED: "true"
       DAGSTER_API_URL: "http://dagster:3000"
 
     volumes:
       - ./gradio/diarization/outputs:/app/outputs
       - ./models/pyannote:/root/.cache/huggingface/hub
+      - ./minio-certs/public.crt:/app/certs/public.crt:ro
     networks:
       - app_network
 
@@ -121,10 +128,12 @@ services:
       MINIO_ENDPOINT: "minio:9000"
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
+      SSE_C_KEY: "${SSE_C_KEY}"
       DAGSTER_ENABLED: "true"
       DAGSTER_API_URL: "http://dagster:3000"
     volumes:
       - /data/911/911_whisper_model:/app/models
+      - ./minio-certs/public.crt:/app/certs/public.crt:ro
     networks:
       - app_network
 
@@ -141,21 +150,42 @@ services:
     build: ./backend
     container_name: transcript_backend
     restart: unless-stopped
-    ports:
-      - "8000:8000" # expose backend to LAN
+    # No host port mapping — the browser now reaches this over TLS via the
+    # "caddy" reverse proxy below, not directly. Gin itself still just
+    # speaks plain HTTP on :8000, but only inside the Docker network.
     environment:
       MINIO_ENDPOINT: "minio:9000"
-      MINIO_PUBLIC_ENDPOINT: "localhost:9000"
+      SSE_C_KEY: "${SSE_C_KEY}"
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
       QDRANT_HOST: "http://qdrant:6333"
       DATABASE_URL: "postgres://transcript_app:${POSTGRES_PASSWORD:-changeme_dev_only}@postgres:5432/transcript_security?sslmode=disable"
       JWT_SECRET: "${JWT_SECRET:-dev_only_insecure_secret_change_me}"
+      FRONTEND_ORIGIN: "${FRONTEND_ORIGIN:-https://localhost:3443}"
+    volumes:
+      - ./minio-certs/public.crt:/app/certs/public.crt:ro
     depends_on:
       minio:
         condition: service_started
       postgres:
         condition: service_healthy
+    networks:
+      - app_network
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: transcript_caddy
+    restart: unless-stopped
+    ports:
+      - "8000:8000" # browser <-> backend API TLS terminates here
+      - "3443:3443" # browser <-> frontend TLS terminates here
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./backend-certs/public.crt:/certs/public.crt:ro
+      - ./backend-certs/private.key:/certs/private.key:ro
+    depends_on:
+      - backend
+      - frontend
     networks:
       - app_network
 
@@ -165,8 +195,8 @@ services:
       dockerfile: Dockerfile
     container_name: transcript_frontend
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    # No host port mapping — the browser now reaches this over TLS via
+    # "caddy" (like backend above), not directly on plain HTTP.
     depends_on:
       - backend
     networks:

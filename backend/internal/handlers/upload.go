@@ -45,13 +45,20 @@ func UploadFile(c *gin.Context) {
 		return
 	}
 
-	// Upload to MinIO
+	// Upload to MinIO — encrypted at rest via SSE-C (AES-256)
 	bucket := "uploads"
 	ctx := context.Background()
 	objectName := fmt.Sprintf("%s_%s", fileID, file.Filename)
 
+	sse, err := services.SSE()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("encryption not configured: %v", err)})
+		return
+	}
+
 	_, err = services.MinioClient.FPutObject(ctx, bucket, objectName, localPath, minio.PutObjectOptions{
-		ContentType: "application/octet-stream",
+		ContentType:          "application/octet-stream",
+		ServerSideEncryption: sse,
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to upload to MinIO: %v", err)})
@@ -111,6 +118,10 @@ func UploadFile(c *gin.Context) {
 				log.Printf("✅ Pushed conversion job to Redis for file %s", fileID)
 			}
 		}
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "file_upload", "transcript", fileID, c.ClientIP(), map[string]interface{}{"filename": file.Filename}); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
 	}
 
 	// Return response

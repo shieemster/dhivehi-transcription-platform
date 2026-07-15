@@ -1,25 +1,27 @@
 package handlers
 
 import (
+	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"time"
 
 	"transcript_app/backend/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
 
-const fileURLExpiry = 15 * time.Minute
-
-// GetFileURL handles GET /files/:job_id — issues a short-lived signed URL
-// for the underlying MinIO object, after checking the caller is actually
-// allowed to see this specific transcript (not just "some" transcripts).
+// GetFile handles GET /files/:job_id — streams the decrypted file directly
+// in the response, after checking the caller is actually allowed to see
+// this specific transcript (not just "some" transcripts).
 //
-// This is what replaced the public-read bucket policy: instead of a
-// permanent, unauthenticated URL anyone could reuse forever, every file
-// access now goes through RBAC + ownership checks and expires quickly.
-func GetFileURL(c *gin.Context) {
+// This used to return a presigned URL the browser could fetch on its own.
+// Now that objects are encrypted at rest with SSE-C, that's no longer
+// possible — the decryption key has to be sent as a request header, which
+// a presigned/query-string-auth URL can't carry. So the backend is now the
+// only thing that ever talks to MinIO directly: it fetches + decrypts,
+// then streams the plaintext bytes straight into this response.
+func GetFile(c *gin.Context) {
 	jobID := c.Param("job_id")
 	claims := c.MustGet("claims").(*services.Claims)
 	grantedSet := c.MustGet("permissions").(map[string]bool)
@@ -30,8 +32,8 @@ func GetFileURL(c *gin.Context) {
 		return
 	}
 
-	// view_all / view_team: any transcript. view_own only: must be the uploader.
 	if !canAccessTranscript(claims, grantedSet, transcript.UploadedBy) {
+		logAccessDenied(c, claims, "transcript", jobID, "GetFile")
 		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to access this file"})
 		return
 	}
@@ -41,15 +43,24 @@ func GetFileURL(c *gin.Context) {
 		return
 	}
 
-	url, err := services.GeneratePresignedURL(c.Request.Context(), transcript.MinioBucket, transcript.MinioObject, fileURLExpiry)
+	obj, info, err := services.StreamObject(c.Request.Context(), transcript.MinioBucket, transcript.MinioObject)
 	if err != nil {
-		log.Printf("⚠️ presign failed for %s/%s: %v", transcript.MinioBucket, transcript.MinioObject, err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate file URL"})
+		log.Printf("⚠️ stream failed for %s/%s: %v", transcript.MinioBucket, transcript.MinioObject, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve file"})
 		return
 	}
+	defer obj.Close()
 
-	c.JSON(http.StatusOK, gin.H{
-		"url":        url,
-		"expires_in": int(fileURLExpiry.Seconds()),
-	})
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "file_download", "transcript", jobID, c.ClientIP(), map[string]interface{}{"filename": transcript.Filename}); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, transcript.Filename))
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Length", fmt.Sprintf("%d", info.Size))
+	c.Status(http.StatusOK)
+
+	if _, err := io.Copy(c.Writer, obj); err != nil {
+		log.Printf("⚠️ error streaming file to client: %v", err)
+	}
 }

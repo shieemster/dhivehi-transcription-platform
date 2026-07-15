@@ -12,6 +12,22 @@ import (
 
 const accessTokenTTL = 8 * time.Hour
 
+// logLoginFailure records a failed login attempt with no resolved user_id
+// (the attempt may be against an email that doesn't even exist), so these
+// show up in the audit log without a foreign-key user reference. It also
+// counts the attempt toward the email+IP lockout thresholds, so every
+// failure path (bad email, wrong password, disabled account, wrong MFA
+// code) contributes to rate limiting without each call site needing to
+// remember to do so separately.
+func logLoginFailure(c *gin.Context, attemptedEmail, reason string) {
+	if err := services.LogAudit(c.Request.Context(), nil, attemptedEmail, "login_failed", "user", "", c.ClientIP(), map[string]interface{}{"reason": reason}); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+	if err := services.RecordFailedLogin(c.Request.Context(), attemptedEmail, c.ClientIP()); err != nil {
+		log.Printf("⚠️ failed to record login attempt: %v", err)
+	}
+}
+
 type loginRequest struct {
 	Email    string `json:"email" binding:"required"`
 	Password string `json:"password" binding:"required"`
@@ -28,11 +44,25 @@ func Login(c *gin.Context) {
 		return
 	}
 
+	locked, retryAfter, err := services.CheckLoginLockout(c.Request.Context(), req.Email, c.ClientIP())
+	if err != nil {
+		log.Printf("⚠️ login lockout check failed: %v", err)
+		// Fail open — a Redis hiccup shouldn't lock legitimate users out of
+		// the app entirely, and the failure is logged for visibility.
+	} else if locked {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error":       "too many failed login attempts, please try again later",
+			"retry_after": int(retryAfter.Seconds()),
+		})
+		return
+	}
+
 	user, err := services.GetUserByEmail(c.Request.Context(), req.Email)
 	if err != nil {
 		if err != services.ErrUserNotFound {
 			log.Printf("⚠️ login lookup error for %s: %v", req.Email, err)
 		}
+		logLoginFailure(c, req.Email, "no_such_user")
 		// Same response for "no such user" and "wrong password" — don't leak
 		// which emails are registered.
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
@@ -40,11 +70,13 @@ func Login(c *gin.Context) {
 	}
 
 	if !user.IsActive {
+		logLoginFailure(c, req.Email, "account_disabled")
 		c.JSON(http.StatusForbidden, gin.H{"error": "account is disabled"})
 		return
 	}
 
 	if err := services.VerifyPassword(user, req.Password); err != nil {
+		logLoginFailure(c, req.Email, "wrong_password")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid email or password"})
 		return
 	}
@@ -55,6 +87,7 @@ func Login(c *gin.Context) {
 			return
 		}
 		if !services.ValidateTOTPCode(user.MFASecret, req.MFACode) {
+			logLoginFailure(c, req.Email, "wrong_mfa_code")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid MFA code"})
 			return
 		}
@@ -65,6 +98,11 @@ func Login(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to issue token"})
 		return
 	}
+
+	if err := services.LogAudit(c.Request.Context(), &user.ID, user.Email, "login_success", "user", user.ID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+	services.ResetLoginAttempts(c.Request.Context(), req.Email, c.ClientIP())
 
 	c.JSON(http.StatusOK, gin.H{
 		"token":      token,
@@ -87,9 +125,13 @@ func Logout(c *gin.Context) {
 		return
 	}
 
-	if err := services.RevokeJWT(c.Request.Context(), claims.(*services.Claims)); err != nil {
+	claimsTyped := claims.(*services.Claims)
+	if err := services.RevokeJWT(c.Request.Context(), claimsTyped); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke token"})
 		return
+	}
+	if err := services.LogAudit(c.Request.Context(), &claimsTyped.UserID, claimsTyped.Email, "logout", "user", claimsTyped.UserID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
 }
@@ -110,7 +152,7 @@ func MFAEnrollStart(c *gin.Context) {
 	// qrcode.js library) from provisioning_uri, and so it can be echoed
 	// back in the confirm step below.
 	c.JSON(http.StatusOK, gin.H{
-		"secret":          secret,
+		"secret":           secret,
 		"provisioning_uri": uri,
 	})
 }
@@ -134,6 +176,10 @@ func MFAEnrollConfirm(c *gin.Context) {
 	if err := services.VerifyAndEnableMFA(c.Request.Context(), claims.UserID, req.Secret, req.Code); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "mfa_enabled", "user", claims.UserID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "MFA enabled"})

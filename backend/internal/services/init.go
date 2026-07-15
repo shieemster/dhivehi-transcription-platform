@@ -3,6 +3,8 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -18,6 +20,35 @@ var (
 	MinioClient *minio.Client
 	RedisClient *redis.Client
 )
+
+// minioTLSTransport builds an http.RoundTripper that trusts MinIO's
+// self-signed certificate specifically (loaded from a file both this
+// backend and the minio container have mounted), instead of either
+// requiring a real CA-signed cert (overkill for local dev) or disabling
+// certificate verification entirely (which would defeat the point of
+// using TLS at all).
+func minioTLSTransport() (http.RoundTripper, error) {
+	certPath := os.Getenv("MINIO_CERT_PATH")
+	if certPath == "" {
+		certPath = "/app/certs/public.crt"
+	}
+
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read MinIO cert at %s: %w", certPath, err)
+	}
+
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		return nil, fmt.Errorf("failed to parse MinIO cert at %s", certPath)
+	}
+
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{
+			RootCAs: pool,
+		},
+	}, nil
+}
 
 // InitializeServices initializes PostgreSQL, MinIO, Qdrant, and Redis with auto-creation
 func InitializeServices() error {
@@ -62,10 +93,21 @@ func initMinIO(ctx context.Context) error {
 		secretKey = "minio123"
 	}
 
-	var err error
+	// MinIO now runs with TLS (required for SSE-C — customer encryption
+	// keys must never travel over plain HTTP). It's a self-signed cert for
+	// this local dev environment, so rather than blanket-disabling cert
+	// verification (InsecureSkipVerify), we load and trust this specific
+	// certificate — still verifies we're actually talking to the real
+	// MinIO and not something else, just without a public CA behind it.
+	transport, err := minioTLSTransport()
+	if err != nil {
+		return fmt.Errorf("failed to set up MinIO TLS transport: %w", err)
+	}
+
 	MinioClient, err = minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: false,
+		Creds:     credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure:    true,
+		Transport: transport,
 	})
 	if err != nil {
 		return err
@@ -93,9 +135,12 @@ func initMinIO(ctx context.Context) error {
 		// A previous version of this code set Principal: {"AWS": ["*"]} on
 		// every bucket, meaning anyone with an object URL could download it
 		// directly from MinIO — completely bypassing JWT auth and RBAC.
-		// Files are now served exclusively through GET /files/:job_id, which
-		// checks the caller's permissions/ownership and issues a short-lived
-		// presigned URL — see handlers.GetFileURL.
+		// Objects are also encrypted at rest with SSE-C (see services.SSE),
+		// so even bucket policy alone wouldn't matter — decrypting a read
+		// requires the SSE-C key, which only the backend holds. Files are
+		// served exclusively through GET /files/:job_id and the segment
+		// audio endpoint, which check permissions/ownership and stream the
+		// decrypted bytes directly rather than handing out a URL.
 		//
 		// IMPORTANT: MinIO bucket policies persist in its own storage across
 		// restarts. If this bucket previously had the public-read policy

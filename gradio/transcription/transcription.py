@@ -9,6 +9,8 @@ from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import librosa
 import tempfile
 import noisereduce as nr
+from minio import Minio
+from minio.credentials import StaticProvider
 # =========================
 # Environment & Setup
 # =========================
@@ -16,15 +18,37 @@ import noisereduce as nr
 # Redis connection
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+r = redis.Redis(
+    host=REDIS_HOST, port=REDIS_PORT, db=0,
+    socket_keepalive=True, health_check_interval=30, retry_on_timeout=True,
+    socket_timeout=None,
+)
 
 # Qdrant backend API
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "file_metadata")
 
 # MinIO credentials for downloading segments
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio123")
+minio_client = Minio(
+    MINIO_ENDPOINT,
+    credentials=StaticProvider(MINIO_ACCESS_KEY, MINIO_SECRET_KEY),
+    secure=False
+)
+
+def download_from_minio_url(minio_url: str) -> bytes:
+    """Fetch an object's bytes via the authenticated MinIO client instead
+    of a plain HTTP GET, which now correctly returns 403 on private buckets."""
+    path = minio_url.split(f"{MINIO_ENDPOINT}/", 1)[-1]
+    bucket, object_name = path.split("/", 1)
+    response = minio_client.get_object(bucket, object_name)
+    try:
+        return response.read()
+    finally:
+        response.close()
+        response.release_conn()
 
 #Dagster integration
 DAGSTER_ENABLED = os.getenv("DAGSTER_ENABLED", "false").lower() == "true"
@@ -91,12 +115,11 @@ def download_audio_segment(minio_url, start_time, end_time):
     """Download audio from MinIO and extract segment"""
     try:
         # Download full audio file
-        resp = requests.get(minio_url)
-        resp.raise_for_status()
-        
+        audio_bytes = download_from_minio_url(minio_url)
+
         # Save to temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_file:
-            tmp_file.write(resp.content)
+            tmp_file.write(audio_bytes)
             tmp_path = tmp_file.name
         
         # Load audio and extract segment

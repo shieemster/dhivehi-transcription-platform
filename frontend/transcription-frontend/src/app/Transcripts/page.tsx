@@ -12,6 +12,7 @@ import { Slider } from "@/components/ui/slider";
 import { Upload, FileText, X, Moon, Sun, Check } from "lucide-react";
 import { useTheme } from "next-themes";
 import { BACKEND_URL } from "@/config";
+import { useAuth } from "@/contexts/AuthContext";
 
 export default function NewTranscript() {
   return (
@@ -68,6 +69,13 @@ function NewTranscriptPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const jobId = searchParams.get('job_id');
+  const { authFetch, token, isLoading: authLoading } = useAuth();
+
+  useEffect(() => {
+    if (!authLoading && !token) {
+      router.push("/login");
+    }
+  }, [authLoading, token, router]);
 
   const [open, setOpen] = useState(false);
   const [category, setCategory] = useState("");
@@ -170,7 +178,7 @@ function NewTranscriptPage() {
     formData.append("speakers", Math.floor(speakers[0]).toString());
 
     try {
-      const res = await fetch(`${BACKEND_URL}/upload`, {
+      const res = await authFetch(`${BACKEND_URL}/upload`, {
         method: "POST",
         body: formData,
       });

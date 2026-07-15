@@ -6,7 +6,8 @@ import { Card, CardHeader, CardContent, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
-import { QDRANT_URL } from "@/config";
+import { BACKEND_URL } from "@/config";
+import { useAuth } from "@/contexts/AuthContext";
 import {
   Upload,
   Search,
@@ -73,6 +74,7 @@ interface Transcript {
 
 export default function TranscriptList() {
   const router = useRouter();
+  const { authFetch, token, isLoading: authLoading } = useAuth();
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -80,182 +82,65 @@ export default function TranscriptList() {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterCategory, setFilterCategory] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
-  const [nextPageOffset, setNextPageOffset] = useState<any>(null);
-  const [hasMore, setHasMore] = useState(true);
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const fetchingRef = useRef(false);
 
   useEffect(() => {
-    fetchFromQdrant(true);
-  }, []);
+    if (!authLoading && !token) {
+      router.push("/login");
+    }
+  }, [authLoading, token, router]);
 
   useEffect(() => {
-    const handleScroll = () => {
-      if (fetchingRef.current || loadingMore || !hasMore || loading) return;
-
-      const scrollHeight = document.documentElement.scrollHeight;
-      const scrollTop = document.documentElement.scrollTop || window.pageYOffset;
-      const clientHeight = window.innerHeight;
-
-      if (scrollTop + clientHeight >= scrollHeight - 300) {
-        fetchFromQdrant(false);
-      }
-    };
-
-    if (!loading) {
-      window.addEventListener('scroll', handleScroll, { passive: true });
-      return () => window.removeEventListener('scroll', handleScroll);
+    if (token) {
+      fetchTranscripts();
     }
-  }, [loadingMore, hasMore, nextPageOffset, loading]);
+  }, [token]);
 
-  const fetchFromQdrant = async (isInitial: boolean = false) => {
+
+  const fetchTranscripts = async () => {
     if (fetchingRef.current) return;
-    if (!isInitial && (!hasMore || loadingMore)) return;
-
     fetchingRef.current = true;
 
     try {
-      if (isInitial) {
-        setLoading(true);
-        setTranscripts([]);
-        setNextPageOffset(null);
-        setHasMore(true);
-      } else {
-        setLoadingMore(true);
-      }
-
+      setLoading(true);
       setError(null);
 
-      const collectionsResponse = await fetch(`${QDRANT_URL}/collections`);
-
-      if (!collectionsResponse.ok) {
-        throw new Error(`Cannot connect to Qdrant at ${QDRANT_URL}`);
-      }
-
-      const collectionsData = await collectionsResponse.json();
-      const collections = collectionsData.result?.collections || [];
-
-      const collectionExists = collections.some((c: any) => c.name === 'file_metadata');
-
-      if (!collectionExists) {
-        const collectionNames = collections.map((c: any) => c.name).join(', ');
-        throw new Error(
-          `Collection "file_metadata" not found. Available collections: ${collectionNames || 'none'}.`
-        );
-      }
-
-      const requestBody: any = {
-        limit: 10,
-        with_payload: true,
-        with_vector: false,
-        filter: {
-          must: [
-            {
-              key: "type",
-              match: {
-                value: "parent"
-              }
-            }
-          ]
-        }
-      };
-
-      if (!isInitial && nextPageOffset) {
-        requestBody.offset = nextPageOffset;
-      }
-
-      const response = await fetch(`${QDRANT_URL}/collections/file_metadata/points/scroll`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(requestBody)
-      });
+      const response = await authFetch(`${BACKEND_URL}/transcripts`);
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to fetch points: ${response.status} - ${errorText}`);
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Failed to fetch transcripts: ${response.status}`);
       }
 
       const data = await response.json();
+      const items = data ?? [];
 
-      const parentPoints = data.result.points.filter((point: any) => point.payload.type === 'parent');
-
-      const transformedTranscripts = await Promise.all(parentPoints.map(async (point: any, index: number) => {
-        const uniqueId = typeof point.id === 'object'
-          ? `${point.id.num || point.id.uuid || Date.now()}_${index}`
-          : `${point.id}_${index}_${Date.now()}`;
-
-        let calculatedDuration = 0;
-
-        try {
-          const segResponse = await fetch(`${QDRANT_URL}/collections/file_metadata/points/scroll`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              filter: {
-                must: [
-                  { key: "type", match: { value: "segment" } },
-                  { key: "parent_job_id", match: { value: point.payload.job_id } }
-                ]
-              },
-              limit: 1000,
-              with_payload: true,
-              with_vector: false
-            })
-          });
-
-          if (segResponse.ok) {
-            const segData = await segResponse.json();
-            if (segData.result.points.length > 0) {
-              const segments = segData.result.points.sort((a: any, b: any) =>
-                (b.payload.segment_index || 0) - (a.payload.segment_index || 0)
-              );
-              calculatedDuration = segments[0].payload.end_time || 0;
-            }
-          }
-        } catch (err) {
-          console.log('Could not fetch segment duration for', point.payload.job_id);
-          calculatedDuration = parseFloat(point.payload.duration) || 0;
-        }
-
-        return {
-          id: point.payload.job_id || uniqueId,
-          filename: point.payload.filename || 'Unknown',
-          category: point.payload.category || 'Uncategorized',
-          reference_number: point.payload.reference_number || 'N/A',
-          status: point.payload.status || 'unknown',
-          timestamp: point.payload.timestamp || new Date().toISOString(),
-          duration: calculatedDuration,
-          speakers: Math.floor(point.payload.speakers || 0),
-          segments: point.payload.segments || 0,
-          notes: point.payload.notes || ''
-        };
+      const transformed: Transcript[] = items.map((t: any) => ({
+        id: t.id,
+        filename: t.filename || 'Unknown',
+        category: t.category || 'Uncategorized',
+        reference_number: t.reference_number || 'N/A',
+        status: t.status || 'unknown',
+        timestamp: t.timestamp || new Date().toISOString(),
+        duration: t.duration || 0,
+        speakers: Math.floor(t.speakers || 0),
+        segments: t.segments || 0,
+        notes: t.notes || ''
       }));
 
-      const newTranscripts = isInitial ? transformedTranscripts : [...transcripts, ...transformedTranscripts];
-
-      const sortedTranscripts = newTranscripts.sort((a: Transcript, b: Transcript) =>
+      transformed.sort((a: Transcript, b: Transcript) =>
         new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
       );
 
-      setTranscripts(sortedTranscripts);
-      setNextPageOffset(data.result.next_page_offset || null);
-      setHasMore(data.result.next_page_offset !== null && transformedTranscripts.length > 0);
-
+      setTranscripts(transformed);
     } catch (err) {
-      console.error("Failed to fetch from Qdrant:", err);
+      console.error("Failed to fetch transcripts:", err);
       setError(err instanceof Error ? err.message : 'Failed to load transcripts');
     } finally {
       fetchingRef.current = false;
-      if (isInitial) {
-        setLoading(false);
-      } else {
-        setLoadingMore(false);
-      }
+      setLoading(false);
     }
   };
 
@@ -271,53 +156,14 @@ export default function TranscriptList() {
     try {
       setDeletingIds(prev => new Set(prev).add(transcriptId));
 
-      console.log('Starting deletion for job_id:', transcriptId);
-
-      // Step 1: Delete all segments with this parent_job_id
-      const deleteSegmentsResponse = await fetch(`${QDRANT_URL}/collections/file_metadata/points/delete`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          filter: {
-            must: [
-              { key: "type", match: { value: "segment" } },
-              { key: "parent_job_id", match: { value: transcriptId } }
-            ]
-          }
-        })
+      const response = await authFetch(`${BACKEND_URL}/transcripts/${transcriptId}`, {
+        method: 'DELETE',
       });
 
-      if (!deleteSegmentsResponse.ok) {
-        const errorText = await deleteSegmentsResponse.text();
-        throw new Error(`Failed to delete segments: ${errorText}`);
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Failed to delete transcript: ${response.status}`);
       }
-
-      console.log('Segments deleted successfully');
-
-      // Step 2: Delete the parent transcript
-      const deleteParentResponse = await fetch(`${QDRANT_URL}/collections/file_metadata/points/delete`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          filter: {
-            must: [
-              { key: "type", match: { value: "parent" } },
-              { key: "job_id", match: { value: transcriptId } }
-            ]
-          }
-        })
-      });
-
-      if (!deleteParentResponse.ok) {
-        const errorText = await deleteParentResponse.text();
-        throw new Error(`Failed to delete parent: ${errorText}`);
-      }
-
-      console.log('Parent deleted successfully');
 
       // Remove from local state
       setTranscripts(prev => prev.filter(t => t.id !== transcriptId));
@@ -459,7 +305,7 @@ export default function TranscriptList() {
                 <p className="text-red-600 dark:text-red-300 text-sm">{error}</p>
               </div>
               <Button
-                onClick={() => fetchFromQdrant(true)}
+                onClick={() => fetchTranscripts()}
                 variant="outline"
                 size="sm"
                 className="ml-auto"
@@ -644,17 +490,7 @@ export default function TranscriptList() {
 
         <div className="mt-6 text-center text-sm text-stone-600 dark:text-neutral-400">
           Showing {filteredTranscripts.length} of {transcripts.length} transcripts
-          {hasMore && !loadingMore && <span className="block mt-2">Scroll down to load more...</span>}
         </div>
-
-        {loadingMore && (
-          <div className="mt-6 mb-12 text-center">
-            <div className="inline-flex items-center gap-2 px-4 py-2 bg-stone-100 dark:bg-neutral-800 rounded-lg">
-              <div className="w-4 h-4 border-2 border-stone-600 dark:border-neutral-400 border-t-transparent rounded-full animate-spin"></div>
-              <span className="text-sm text-stone-600 dark:text-neutral-400">Loading more transcripts...</span>
-            </div>
-          </div>
-        )}
       </main>
     </div>
   );

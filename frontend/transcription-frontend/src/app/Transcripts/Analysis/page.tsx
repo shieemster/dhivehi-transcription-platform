@@ -28,6 +28,7 @@ import {
 import { useTheme } from "next-themes";
 import PdfExportModal from "@/components/PdfExportModal";
 import { generateTranscriptPdf, PdfSegmentData } from "@/lib/pdfGenerator";
+import { useAuth } from "@/contexts/AuthContext";
 
 export default function AnalysisPage() {
   return (
@@ -86,6 +87,13 @@ function AnalysisPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const jobId = searchParams.get('job_id');
+  const { authFetch, token, isLoading: authLoading } = useAuth();
+
+  useEffect(() => {
+    if (!authLoading && !token) {
+      router.push("/login");
+    }
+  }, [authLoading, token, router]);
 
   const [mounted, setMounted] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -233,7 +241,7 @@ function AnalysisPageContent() {
     setAnalysing(true);
     setAnalysisError(null);
     try {
-      const resp = await fetch(`${BACKEND_URL}/transcripts/${jobId}/analyse`, {
+      const resp = await authFetch(`${BACKEND_URL}/transcripts/${jobId}/analyse`, {
         method: 'POST',
       });
       if (!resp.ok) {

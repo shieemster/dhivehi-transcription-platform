@@ -1,0 +1,134 @@
+package services
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"transcript_app/backend/internal/models"
+
+	"github.com/jackc/pgx/v5"
+	"golang.org/x/crypto/bcrypt"
+)
+
+var ErrUserNotFound = errors.New("user not found")
+var ErrEmailTaken = errors.New("email already registered")
+var ErrInvalidCredentials = errors.New("invalid email or password")
+
+// CreateUser hashes the password with bcrypt and inserts a new user under
+// the given role name (must be one of the four seeded roles). It never
+// stores or returns the plaintext password.
+func CreateUser(ctx context.Context, email, displayName, plainPassword, roleName string) (*models.User, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(plainPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	row := DB.QueryRow(ctx, `
+		INSERT INTO users (email, display_name, password_hash, role_id)
+		SELECT $1, $2, $3, roles.id FROM roles WHERE roles.name = $4
+		RETURNING id, email, display_name, role_id, mfa_enabled, is_active, created_at
+	`, email, displayName, string(hash), roleName)
+
+	var u models.User
+	if err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.MFAEnabled, &u.IsActive, &u.CreatedAt); err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrEmailTaken
+		}
+		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+	u.RoleName = roleName
+	return &u, nil
+}
+
+// GetUserByEmail returns the full user record including password_hash —
+// intended for the login handler only. Everywhere else, use the
+// JSON-serializable fields on models.User (PasswordHash is tagged "-").
+func GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
+	row := DB.QueryRow(ctx, `
+		SELECT u.id, u.email, u.display_name, u.password_hash, u.role_id, r.name,
+		       COALESCE(u.mfa_secret, ''), u.mfa_enabled, u.is_active, u.created_at
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		WHERE u.email = $1
+	`, email)
+
+	var u models.User
+	if err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.PasswordHash, &u.RoleID, &u.RoleName,
+		&u.MFASecret, &u.MFAEnabled, &u.IsActive, &u.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("failed to fetch user: %w", err)
+	}
+	return &u, nil
+}
+
+// VerifyPassword checks a plaintext password against the stored bcrypt hash.
+// Returns ErrInvalidCredentials on mismatch — deliberately the same error
+// as "user not found" callers should use, to avoid leaking which emails exist.
+func VerifyPassword(u *models.User, plainPassword string) error {
+	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(plainPassword)); err != nil {
+		return ErrInvalidCredentials
+	}
+	return nil
+}
+
+// GetUserPermissions returns the permission codes granted to a user's role,
+// e.g. "transcript:upload", "audit_log:view_team". This is what RBAC
+// middleware (added in the next step) will check against each route.
+func GetUserPermissions(ctx context.Context, roleID int16) ([]string, error) {
+	rows, err := DB.Query(ctx, `
+		SELECT p.code FROM role_permissions rp
+		JOIN permissions p ON p.id = rp.permission_id
+		WHERE rp.role_id = $1
+	`, roleID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch permissions: %w", err)
+	}
+	defer rows.Close()
+
+	var perms []string
+	for rows.Next() {
+		var code string
+		if err := rows.Scan(&code); err != nil {
+			return nil, err
+		}
+		perms = append(perms, code)
+	}
+	return perms, rows.Err()
+}
+
+
+func GetPermissionsByRoleName(ctx context.Context, roleName string) ([]string, error) {
+	rows, err := DB.Query(ctx, `
+		SELECT p.code FROM role_permissions rp
+		JOIN permissions p ON p.id = rp.permission_id
+		JOIN roles r ON r.id = rp.role_id
+		WHERE r.name = $1
+	`, roleName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch permissions for role %s: %w", roleName, err)
+	}
+	defer rows.Close()
+
+	var perms []string
+	for rows.Next() {
+		var code string
+		if err := rows.Scan(&code); err != nil {
+			return nil, err
+		}
+		perms = append(perms, code)
+	}
+	return perms, rows.Err()
+}
+
+
+func isUniqueViolation(err error) bool {
+	// pgx wraps *pgconn.PgError; code 23505 = unique_violation.
+	var pgErr interface{ SQLState() string }
+	if errors.As(err, &pgErr) {
+		return pgErr.SQLState() == "23505"
+	}
+	return false
+}

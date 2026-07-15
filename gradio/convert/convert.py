@@ -15,7 +15,11 @@ from minio import Minio
 # Redis connection
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+r = redis.Redis(
+    host=REDIS_HOST, port=REDIS_PORT, db=0,
+    socket_keepalive=True, health_check_interval=30, retry_on_timeout=True,
+    socket_timeout=None,
+)
 
 # MinIO connection
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
@@ -30,6 +34,24 @@ minio_client = Minio(
 )
 
 print("✅ Connected to MinIO and Redis")
+
+def download_from_minio_url(minio_url: str) -> bytes:
+    """
+    Fetch an object's bytes using the authenticated MinIO client instead of
+    a plain HTTP GET. Buckets are private now (no more public-read policy —
+    that was itself a security vulnerability), so a raw requests.get() on
+    the stored URL will always return 403. This parses "bucket/object" out
+    of the URL and downloads it the same way the backend does internally.
+    """
+    # minio_url looks like: http://minio:9000/<bucket>/<object_name>
+    path = minio_url.split(f"{MINIO_ENDPOINT}/", 1)[-1]
+    bucket, object_name = path.split("/", 1)
+    response = minio_client.get_object(bucket, object_name)
+    try:
+        return response.read()
+    finally:
+        response.close()
+        response.release_conn()
 
 # Dagster integration 
 DAGSTER_ENABLED = os.getenv("DAGSTER_ENABLED", "false").lower() == "true"
@@ -130,9 +152,7 @@ def process_file(file_id, minio_url, filename):
         print(f"📥 Downloading video file...")
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp_video:
             video_path = tmp_video.name
-            resp = requests.get(minio_url)
-            resp.raise_for_status()
-            tmp_video.write(resp.content)
+            tmp_video.write(download_from_minio_url(minio_url))
         
         print(f"✅ Downloaded: {os.path.getsize(video_path) / (1024*1024):.2f} MB")
         

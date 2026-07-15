@@ -1,6 +1,27 @@
 
 services:
 
+  postgres:
+    image: postgres:16
+    container_name: transcript_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: transcript_app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_dev_only}
+      POSTGRES_DB: transcript_security
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transcript_app -d transcript_security"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app_network
+
   minio:
     image: minio/minio:latest
     container_name: transcript_minio
@@ -22,9 +43,15 @@ services:
     image: qdrant/qdrant:latest
     container_name: qdrant
     restart: unless-stopped
-    ports:
-      - "6333:6333"
-      - "6334:6334"
+    # NOTE: no "ports:" mapping to the host on purpose. Qdrant has no
+    # authentication of its own by default — it was previously published
+    # on 6333/6334, which combined with the frontend querying it directly
+    # meant anyone who could reach this machine could read (and delete)
+    # every transcript with zero login required, bypassing RBAC entirely.
+    # Backend, Dagster, and Gradio all reach it via the internal Docker
+    # network hostname "qdrant:6333" and don't need the host mapping.
+    # If you need to inspect Qdrant directly for debugging, use:
+    #   docker compose exec backend curl http://qdrant:6333/collections
     volumes:
       - qdrant_data:/qdrant/storage
     networks:
@@ -64,6 +91,9 @@ services:
       QDRANT_HOST: http://qdrant:6333
       QDRANT_COLLECTION: file_metadata
       HUGGINGFACE_ACCESS_TOKEN: ${HUGGINGFACE_ACCESS_TOKEN}
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: "minio"
+      MINIO_SECRET_KEY: "minio123"
       DAGSTER_ENABLED: "true"
       DAGSTER_API_URL: "http://dagster:3000"
 
@@ -88,6 +118,7 @@ services:
       REDIS_PORT: 6379
       QDRANT_HOST: http://qdrant:6333
       QDRANT_COLLECTION: file_metadata
+      MINIO_ENDPOINT: "minio:9000"
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
       DAGSTER_ENABLED: "true"
@@ -114,11 +145,30 @@ services:
       - "8000:8000" # expose backend to LAN
     environment:
       MINIO_ENDPOINT: "minio:9000"
+      MINIO_PUBLIC_ENDPOINT: "localhost:9000"
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
       QDRANT_HOST: "http://qdrant:6333"
+      DATABASE_URL: "postgres://transcript_app:${POSTGRES_PASSWORD:-changeme_dev_only}@postgres:5432/transcript_security?sslmode=disable"
+      JWT_SECRET: "${JWT_SECRET:-dev_only_insecure_secret_change_me}"
     depends_on:
-      - minio
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    networks:
+      - app_network
+
+  frontend:
+    build:
+      context: ./frontend/transcription-frontend
+      dockerfile: Dockerfile
+    container_name: transcript_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
     networks:
       - app_network
 
@@ -153,3 +203,4 @@ volumes:
   minio_data:
   qdrant_data:
   dagster_home:
+  postgres_data:

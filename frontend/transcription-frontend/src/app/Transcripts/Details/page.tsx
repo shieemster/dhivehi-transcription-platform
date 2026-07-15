@@ -7,7 +7,9 @@ import { Card, CardHeader, CardContent, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
-import { QDRANT_URL, MINIO_URL, BACKEND_URL } from "@/config";
+import { BACKEND_URL } from "@/config";
+import { useAuth } from "@/contexts/AuthContext";
+import { apiFetch, ApiError } from "@/lib/api";
 import {
   ArrowLeft,
   Download,
@@ -104,6 +106,13 @@ function TranscriptDetailsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const jobId = searchParams.get('job_id');
+  const { authFetch, token, isLoading: authLoading } = useAuth();
+
+  useEffect(() => {
+    if (!authLoading && !token) {
+      router.push("/login");
+    }
+  }, [authLoading, token, router]);
 
   const [mounted, setMounted] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -130,13 +139,16 @@ function TranscriptDetailsPage() {
 
   useEffect(() => {
     setMounted(true);
-    if (jobId) {
-      fetchTranscriptData();
-    } else {
+    if (authLoading) return;
+    if (!jobId) {
       setError('No job ID provided');
       setLoading(false);
+      return;
     }
-  }, [jobId]);
+    if (token) {
+      fetchTranscriptData();
+    }
+  }, [jobId, token, authLoading]);
 
   useEffect(() => {
     return () => {
@@ -156,45 +168,10 @@ function TranscriptDetailsPage() {
       setLoading(true);
       setError(null);
 
-      const parentResponse = await fetch(`${QDRANT_URL}/collections/file_metadata/points/scroll`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          filter: {
-            must: [
-              {
-                key: "type",
-                match: { value: "parent" }
-              },
-              {
-                key: "job_id",
-                match: { value: jobId }
-              }
-            ]
-          },
-          limit: 1,
-          with_payload: true,
-          with_vector: false
-        })
-      });
-
-      if (!parentResponse.ok) {
-        throw new Error('Failed to fetch parent transcript');
-      }
-
-      const parentData = await parentResponse.json();
-
-      if (parentData.result.points.length === 0) {
-        throw new Error('Transcript not found');
-      }
-
-      const parentPoint = parentData.result.points[0];
-      const parentPayload = parentPoint.payload;
+      const parentPayload = await apiFetch<any>(authFetch, `${BACKEND_URL}/transcripts/${jobId}`);
 
       setParent({
-        job_id: parentPayload.job_id,
+        job_id: parentPayload.id,
         filename: parentPayload.filename,
         category: parentPayload.category || 'Uncategorized',
         reference_number: parentPayload.reference_number || 'N/A',
@@ -215,108 +192,36 @@ function TranscriptDetailsPage() {
         });
       }
 
-      let allSegments: any[] = [];
-      let offset: string | number | null | undefined = undefined;
-      let hasMore = true;
-      let iterationCount = 0;
-      const maxIterations = 50;
+      const segmentPoints = await apiFetch<any[]>(authFetch, `${BACKEND_URL}/transcripts/${jobId}/segments`);
 
-      while (hasMore && iterationCount < maxIterations) {
-        iterationCount++;
+      const transformedSegments: Segment[] = (segmentPoints ?? []).map((s: any) => ({
+        id: `segment-${s.segment_index}`,
+        point_id: `segment-${s.segment_index}`,
+        segment_index: s.segment_index,
+        speaker: s.speaker,
+        start_time: s.start_time,
+        end_time: s.end_time,
+        minio_url: '', // no longer used directly — playback goes through the audio-url endpoint
+        transcript_text: s.transcript_text || 'Transcription pending...',
+        embedding_generated: s.embedding_generated,
+        timestamp: s.timestamp,
+        status: s.status || 'unknown'
+      }));
 
-        const requestBody: any = {
-          filter: {
-            must: [
-              {
-                key: "type",
-                match: { value: "segment" }
-              },
-              {
-                key: "parent_job_id",
-                match: { value: jobId }
-              }
-            ]
-          },
-          limit: 100,
-          with_payload: true,
-          with_vector: false
-        };
-
-        if (offset !== undefined && offset !== null) {
-          requestBody.offset = offset;
-        }
-
-        const segmentsResponse: Response = await fetch(`${QDRANT_URL}/collections/file_metadata/points/scroll`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(requestBody)
-        });
-
-        if (!segmentsResponse.ok) {
-          throw new Error('Failed to fetch segments');
-        }
-
-        const responseText = await segmentsResponse.text();
-
-        const segmentsData: any = JSON.parse(responseText);
-
-        const newPoints = segmentsData.result.points || [];
-        console.log(`Iteration ${iterationCount}: Fetched ${newPoints.length} segments`);
-
-        if (newPoints.length === 0) {
-          break;
-        }
-
-        allSegments = allSegments.concat(newPoints);
-
-        const nextOffset = segmentsData.result.next_page_offset;
-
-        if (nextOffset === null || nextOffset === undefined) {
-          hasMore = false;
-        } else if (nextOffset === offset) {
-          console.warn('Offset not changing, breaking to prevent infinite loop');
-          break;
-        } else {
-          offset = nextOffset;
-        }
-      }
-
-      if (iterationCount >= maxIterations) {
-        console.warn(`Reached maximum iterations (${maxIterations}), stopping fetch`);
-      }
-
-      console.log(`Total segments fetched: ${allSegments.length}`);
-
-      const transformedSegments = allSegments
-        .map((point: any) => ({
-          id: `segment-${point.payload.segment_index}`,
-          point_id: String(point.id),
-          segment_index: point.payload.segment_index,
-          speaker: point.payload.speaker,
-          start_time: point.payload.start_time,
-          end_time: point.payload.end_time,
-          minio_url: point.payload.minio_url,
-          transcript_text: point.payload.transcript_text || 'Transcription pending...',
-          embedding_generated: point.payload.embedding_generated,
-          timestamp: point.payload.timestamp,
-          status: point.payload.status || 'unknown'
-        }))
-        .sort((a: Segment, b: Segment) => a.segment_index - b.segment_index);
-
-      const uniqueSegments = transformedSegments;
-
-      setSegments(uniqueSegments);
+      setSegments(transformedSegments);
 
       const initialTexts: { [key: string]: string } = {};
-      uniqueSegments.forEach((seg: Segment) => {
+      transformedSegments.forEach((seg: Segment) => {
         initialTexts[seg.id] = seg.transcript_text;
       });
       setEditedTexts(initialTexts);
 
     } catch (err) {
       console.error("Failed to fetch transcript data:", err);
+      if (err instanceof ApiError && err.status === 401) {
+        router.push("/login");
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Failed to load transcript');
     } finally {
       setLoading(false);
@@ -376,40 +281,15 @@ function TranscriptDetailsPage() {
       saveLocks.current.add(segmentId);
       setSavingSegments(prev => new Set(prev).add(segmentId));
 
-      console.log('Starting transcript update with filter:', {
-        segmentId,
-        segmentIndex: segment.segment_index,
-        parentJobId: jobId
-      });
-
-      // Use filter-based update instead of point ID to avoid precision issues
-      const updateResponse = await fetch(`${QDRANT_URL}/collections/file_metadata/points/payload?wait=true`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          filter: {
-            must: [
-              { key: "type", match: { value: "segment" } },
-              { key: "parent_job_id", match: { value: jobId } },
-              { key: "segment_index", match: { value: segment.segment_index } }
-            ]
-          },
-          payload: {
-            transcript_text: newText.trim()
-          }
-        })
-      });
-
-      if (!updateResponse.ok) {
-        const errorText = await updateResponse.text();
-        console.error('Update response error:', errorText);
-        throw new Error(`Failed to update payload: ${updateResponse.status}`);
-      }
-
-      const responseData = await updateResponse.json();
-      console.log('Qdrant update successful:', responseData);
+      await apiFetch(
+        authFetch,
+        `${BACKEND_URL}/transcripts/${jobId}/segments/${segment.segment_index}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transcript_text: newText.trim() }),
+        }
+      );
 
       setSegments(prevSegments =>
         prevSegments.map(s =>
@@ -461,20 +341,16 @@ function TranscriptDetailsPage() {
     }
     setAudioProgress({});
 
-    if (!segment.minio_url) {
-      console.error('No audio URL available for this segment');
-      alert('No audio URL available for this segment');
-      return;
-    }
-
     try {
       setAudioLoading(segment.id);
       setAudioProgress({ [segment.id]: 0 });
 
-      const accessibleUrl = segment.minio_url.replace('http://minio:9000', MINIO_URL);
+      const { url: accessibleUrl } = await apiFetch<{ url: string }>(
+        authFetch,
+        `${BACKEND_URL}/transcripts/${jobId}/segments/${segment.segment_index}/audio-url`
+      );
 
       const audio = new Audio();
-      audio.crossOrigin = "anonymous";
       audio.src = accessibleUrl;
       audioRef.current = audio;
 
@@ -608,10 +484,14 @@ function TranscriptDetailsPage() {
     }
   };
 
-  const handleDownload = () => {
-    if (parent?.minio_url) {
-      const downloadUrl = parent.minio_url.replace("http://minio:9000", MINIO_URL);
-      window.open(downloadUrl, "_blank");
+  const handleDownload = async () => {
+    if (!jobId) return;
+    try {
+      const { url } = await apiFetch<{ url: string }>(authFetch, `${BACKEND_URL}/files/${jobId}`);
+      window.open(url, "_blank");
+    } catch (err) {
+      console.error('Failed to get download URL:', err);
+      alert(err instanceof Error ? err.message : 'Failed to prepare download');
     }
   };
 
@@ -906,7 +786,7 @@ function TranscriptDetailsPage() {
                             variant="ghost"
                             size="icon"
                             onClick={() => handlePlayPause(segment)}
-                            disabled={isLoading || !segment.minio_url}
+                            disabled={isLoading}
                             className="text-stone-600 hover:text-stone-900 dark:text-neutral-400 dark:hover:text-white transition-all duration-300 hover:scale-110 disabled:opacity-50"
                           >
                             {isLoading ? (

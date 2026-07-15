@@ -31,6 +31,10 @@ func UploadFile(c *gin.Context) {
 	notes := c.PostForm("notes")
 	speakers := c.PostForm("speakers") // comma-separated string for now
 
+	// Who's uploading — needed for row-level "view_own" scoping in ListTranscripts.
+	// RequireAuth guarantees "claims" is set before this handler runs.
+	claims := c.MustGet("claims").(*services.Claims)
+
 	// Generate unique file ID
 	fileID := uuid.NewString()
 	localPath := fmt.Sprintf("/tmp/%s_%s", fileID, file.Filename)
@@ -67,6 +71,8 @@ func UploadFile(c *gin.Context) {
 		"job_id":           fileID,
 		"filename":         file.Filename,
 		"minio_url":        fileURL,
+		"minio_bucket":     bucket,
+		"minio_object":     objectName,
 		"local_path":       localPath,
 		"status":           "uploaded",
 		"category":         category,
@@ -74,6 +80,7 @@ func UploadFile(c *gin.Context) {
 		"notes":            notes,
 		"speakers":         speakers,
 		"timestamp":        time.Now().UTC().Format(time.RFC3339),
+		"uploaded_by":      claims.UserID,
 	}
 
 	// Insert metadata into Qdrant

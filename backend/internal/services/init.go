@@ -19,9 +19,14 @@ var (
 	RedisClient *redis.Client
 )
 
-// InitializeServices initializes MinIO, Qdrant, and Redis with auto-creation
+// InitializeServices initializes PostgreSQL, MinIO, Qdrant, and Redis with auto-creation
 func InitializeServices() error {
 	ctx := context.Background()
+
+	// Initialize PostgreSQL (users, roles, permissions)
+	if err := initDB(ctx); err != nil {
+		return fmt.Errorf("failed to initialize PostgreSQL: %v", err)
+	}
 
 	// Initialize MinIO
 	if err := initMinIO(ctx); err != nil {
@@ -84,22 +89,21 @@ func initMinIO(ctx context.Context) error {
 			log.Printf("✅ MinIO bucket already exists: %s", bucketName)
 		}
 
-		// Set bucket policy to allow public read access
-		policy := fmt.Sprintf(`{
-			"Version": "2012-10-17",
-			"Statement": [{
-				"Effect": "Allow",
-				"Principal": {"AWS": ["*"]},
-				"Action": ["s3:GetObject"],
-				"Resource": ["arn:aws:s3:::%s/*"]
-			}]
-		}`, bucketName)
-
-		err = MinioClient.SetBucketPolicy(ctx, bucketName, policy)
-		if err != nil {
-			log.Printf("⚠️ Warning: Could not set bucket policy for %s: %v", bucketName, err)
-		} else {
-			log.Printf("✅ Set public read policy for bucket: %s", bucketName)
+		// NOTE: buckets are intentionally left PRIVATE (no public-read policy).
+		// A previous version of this code set Principal: {"AWS": ["*"]} on
+		// every bucket, meaning anyone with an object URL could download it
+		// directly from MinIO — completely bypassing JWT auth and RBAC.
+		// Files are now served exclusively through GET /files/:job_id, which
+		// checks the caller's permissions/ownership and issues a short-lived
+		// presigned URL — see handlers.GetFileURL.
+		//
+		// IMPORTANT: MinIO bucket policies persist in its own storage across
+		// restarts. If this bucket previously had the public-read policy
+		// applied (from before this fix), it stays applied even after we
+		// stop setting it — simply not calling SetBucketPolicy is not enough.
+		// We have to explicitly clear it with an empty policy string.
+		if err := MinioClient.SetBucketPolicy(ctx, bucketName, ""); err != nil {
+			log.Printf("⚠️ Warning: could not clear bucket policy for %s: %v", bucketName, err)
 		}
 	}
 

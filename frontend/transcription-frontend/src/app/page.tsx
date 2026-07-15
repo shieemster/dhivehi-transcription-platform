@@ -1,10 +1,12 @@
 'use client'
 import * as React from "react";
 const { useState, useEffect } = React;
+import { useRouter } from "next/navigation";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Upload, List, Moon, Sun, Loader2 } from "lucide-react";
-import { QDRANT_URL } from "@/config";
+import { Upload, List, Moon, Sun, Loader2, LogOut } from "lucide-react";
+import { BACKEND_URL } from "@/config";
+import { useAuth } from "@/contexts/AuthContext";
 
 // Theme Toggle Component
 function ThemeToggle() {
@@ -39,6 +41,20 @@ function ThemeToggle() {
 
 // Main Component
 export default function TranscriptionApp() {
+  const router = useRouter();
+  const { user, token, isLoading: authLoading, logout, authFetch } = useAuth();
+
+  useEffect(() => {
+    if (!authLoading && !token) {
+      router.push("/login");
+    }
+  }, [authLoading, token, router]);
+
+  async function handleLogout() {
+    await logout();
+    router.push("/login");
+  }
+
   const [hoursTranscribed, setHoursTranscribed] = useState(0);
   const [pendingTranscriptions, setPendingTranscriptions] = useState(0);
   const [completedTranscriptions, setCompletedTranscriptions] = useState(0);
@@ -46,147 +62,30 @@ export default function TranscriptionApp() {
   const [error, setError] = useState<string | null>(null);
   const [theme, setTheme] = useState('light');
 
-  // Fetch stats directly from Qdrant
+  // Fetch stats through the backend (authenticated) — this used to call
+  // Qdrant directly from the browser with no login required at all,
+  // meaning stats (and the underlying data) were reachable by anyone who
+  // could reach the Qdrant port, entirely bypassing RBAC.
   useEffect(() => {
+    if (!token) return; // wait for session to be restored before fetching
+
     const fetchStats = async () => {
       try {
         setLoading(true);
         setError(null);
 
-
-
-        // Check if collection exists
-        const collectionsResponse = await fetch(`${QDRANT_URL}/collections`);
-
-        if (!collectionsResponse.ok) {
-          throw new Error(`Cannot connect to Qdrant at ${QDRANT_URL}`);
-        }
-
-        const collectionsData = await collectionsResponse.json();
-        const collections = collectionsData.result?.collections || [];
-
-        const collectionExists = collections.some((c: any) => c.name === 'file_metadata');
-
-        if (!collectionExists) {
-          throw new Error('Collection "file_metadata" not found');
-        }
-
-        // Fetch all parent transcripts
-        const response = await fetch(`${QDRANT_URL}/collections/file_metadata/points/scroll`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            limit: 1000,
-            with_payload: true,
-            with_vector: false,
-            filter: {
-              must: [
-                {
-                  key: "type",
-                  match: {
-                    value: "parent"
-                  }
-                }
-              ]
-            }
-          })
-        });
+        const response = await authFetch(`${BACKEND_URL}/transcripts/stats`);
 
         if (!response.ok) {
-          throw new Error(`Failed to fetch data: ${response.status}`);
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || `Failed to fetch stats: ${response.status}`);
         }
 
-        const data = await response.json();
-        const parentPoints = data.result.points.filter((point: any) => point.payload.type === 'parent');
+        const stats = await response.json();
 
-        // Fetch ALL segments in one query for better performance
-        const allSegmentsResponse = await fetch(`${QDRANT_URL}/collections/file_metadata/points/scroll`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            limit: 10000, // Fetch many segments at once
-            with_payload: true,
-            with_vector: false,
-            filter: {
-              must: [
-                {
-                  key: "type",
-                  match: {
-                    value: "segment"
-                  }
-                }
-              ]
-            }
-          })
-        });
-
-        // Group segments by parent_job_id and find max end_time for each
-        const segmentDurations = new Map();
-
-        if (allSegmentsResponse.ok) {
-          const allSegmentsData = await allSegmentsResponse.json();
-
-          for (const segment of allSegmentsData.result.points) {
-            const parentJobId = segment.payload.parent_job_id;
-            const endTime = segment.payload.end_time || 0;
-
-            if (!segmentDurations.has(parentJobId) || segmentDurations.get(parentJobId) < endTime) {
-              segmentDurations.set(parentJobId, endTime);
-            }
-          }
-        }
-
-        // Calculate stats using pre-fetched segment durations
-        let completed = 0;
-        let processing = 0;
-        let uploaded = 0;
-        let errorCount = 0;
-        let totalDuration = 0;
-
-        for (const point of parentPoints) {
-          const status = point.payload.status || 'unknown';
-          const jobId = point.payload.job_id;
-
-          // Get duration from pre-fetched segments
-          const calculatedDuration = segmentDurations.get(jobId) || 0;
-
-          totalDuration += calculatedDuration;
-
-          switch (status) {
-            case 'completed':
-            case 'transcribed':
-              completed++;
-              break;
-            case 'processing':
-              processing++;
-              break;
-            case 'uploaded':
-              uploaded++;
-              break;
-            case 'error':
-              errorCount++;
-              break;
-          }
-        }
-
-        // Update state
-        const totalHours = totalDuration / 3600; // Convert seconds to hours
-
-        setHoursTranscribed(totalHours);
-        setPendingTranscriptions(processing + uploaded);
-        setCompletedTranscriptions(completed);
-
-        console.log('Stats loaded:', {
-          totalHours: totalHours.toFixed(2),
-          completed,
-          pending: processing + uploaded,
-          total: parentPoints.length
-        });
-
+        setHoursTranscribed(stats.total_hours ?? 0);
+        setPendingTranscriptions((stats.processing ?? 0) + (stats.uploaded ?? 0));
+        setCompletedTranscriptions(stats.completed ?? 0);
       } catch (err) {
         console.error('Error fetching stats:', err);
         const errorMessage = err instanceof Error ? err.message : 'Failed to fetch stats';
@@ -201,7 +100,7 @@ export default function TranscriptionApp() {
     // Refresh stats every 30 seconds
     const interval = setInterval(fetchStats, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [token, authFetch]);
 
   const handleNavigateToList = () => {
     window.location.href = "/Transcripts/List";
@@ -223,18 +122,36 @@ export default function TranscriptionApp() {
             }`}>
             Transcription App
           </h1>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setTheme(theme === "light" ? "dark" : "light")}
-            className="transition-all duration-300 ease-in-out hover:scale-110"
-          >
-            {theme === "light" ? (
-              <Moon className="h-5 w-5 transition-all duration-300 ease-in-out text-stone-700" />
-            ) : (
-              <Sun className="h-5 w-5 transition-all duration-300 ease-in-out text-neutral-400" />
+          <div className="flex items-center gap-3">
+            {user && (
+              <span className={`text-sm hidden sm:inline ${isDark ? 'text-neutral-300' : 'text-neutral-600'}`}>
+                {user.display_name} · <span className="capitalize">{user.role}</span>
+              </span>
             )}
-          </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => setTheme(theme === "light" ? "dark" : "light")}
+              className="transition-all duration-300 ease-in-out hover:scale-110"
+            >
+              {theme === "light" ? (
+                <Moon className="h-5 w-5 transition-all duration-300 ease-in-out text-stone-700" />
+              ) : (
+                <Sun className="h-5 w-5 transition-all duration-300 ease-in-out text-neutral-400" />
+              )}
+            </Button>
+            {user && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => handleLogout()}
+                title="Log out"
+                className="transition-all duration-300 ease-in-out hover:scale-110"
+              >
+                <LogOut className={`h-5 w-5 ${isDark ? 'text-neutral-300' : 'text-neutral-700'}`} />
+              </Button>
+            )}
+          </div>
         </div>
       </header>
 

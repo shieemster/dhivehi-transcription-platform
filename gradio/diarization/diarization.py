@@ -5,6 +5,8 @@ import requests
 import redis
 from datetime import datetime
 from pyannote.audio import Pipeline
+from minio import Minio
+from minio.credentials import StaticProvider
 
 # =========================
 # Environment & Setup
@@ -24,7 +26,34 @@ print("✅ Pyannote diarization model loaded successfully.")
 # Redis connection
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+r = redis.Redis(
+    host=REDIS_HOST, port=REDIS_PORT, db=0,
+    socket_keepalive=True, health_check_interval=30, retry_on_timeout=True,
+    socket_timeout=None,  # let blpop's own timeout= control blocking, not a separate shorter socket timeout
+)
+
+# MinIO connection — buckets are private (no public-read policy), so
+# fetching source audio requires real credentials, not a plain HTTP GET.
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minio")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio123")
+minio_client = Minio(
+    MINIO_ENDPOINT,
+    credentials=StaticProvider(MINIO_ACCESS_KEY, MINIO_SECRET_KEY),
+    secure=False
+)
+
+def download_from_minio_url(minio_url: str) -> bytes:
+    """Fetch an object's bytes via the authenticated MinIO client instead
+    of a plain HTTP GET, which now correctly returns 403 on private buckets."""
+    path = minio_url.split(f"{MINIO_ENDPOINT}/", 1)[-1]
+    bucket, object_name = path.split("/", 1)
+    response = minio_client.get_object(bucket, object_name)
+    try:
+        return response.read()
+    finally:
+        response.close()
+        response.release_conn()
 
 # Qdrant backend API
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://qdrant:6333")
@@ -247,7 +276,22 @@ def worker_loop():
     print("🚀 Diarization worker started, waiting for jobs...")
     while True:
         try:
-            _, job_data = r.blpop("diarization_queue")
+            # NOTE: previously this was r.blpop("diarization_queue") with no
+            # timeout, which blocks indefinitely. On Docker Desktop (Windows)
+            # long-idle connections can get silently dropped by the network
+            # layer, which then surfaces as an unrecoverable client-side
+            # TimeoutError — the except below caught it, but the underlying
+            # connection was often left in a bad state, causing every
+            # subsequent call to fail the same way instead of actually
+            # waiting for real jobs. A bounded timeout (matching the pattern
+            # already used in convert.py and transcription.py) avoids this
+            # by periodically returning None and giving the loop a chance
+            # to re-establish a healthy connection.
+            result = r.blpop("diarization_queue", timeout=10)
+            if result is None:
+                continue  # no job yet, loop and try again
+
+            _, job_data = result
             job = json.loads(job_data)
             file_id = job["file_id"]
             minio_url = job["minio_url"]
@@ -256,10 +300,8 @@ def worker_loop():
 
             # Download audio from MinIO
             local_path = os.path.join("/tmp", f"{file_id}.wav")
-            resp = requests.get(minio_url)
-            resp.raise_for_status()
             with open(local_path, "wb") as f:
-                f.write(resp.content)
+                f.write(download_from_minio_url(minio_url))
 
             # Run diarization
             segments, rttm_path = diarize_file(local_path)

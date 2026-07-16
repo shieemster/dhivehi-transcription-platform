@@ -4,45 +4,18 @@ const { useState, useEffect } = React;
 import { useRouter } from "next/navigation";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Upload, List, Moon, Sun, Loader2, LogOut, ShieldCheck } from "lucide-react";
+import { Upload, List, Moon, Sun, Loader2, LogOut, ShieldCheck, UserCog } from "lucide-react";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
-
-// Theme Toggle Component
-function ThemeToggle() {
-  const [theme, setTheme] = useState('light');
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => setMounted(true), []);
-
-  if (!mounted) {
-    return (
-      <Button variant="ghost" size="icon" disabled>
-        <Sun className="h-5 w-5" />
-      </Button>
-    );
-  }
-
-  return (
-    <Button
-      variant="ghost"
-      size="icon"
-      onClick={() => setTheme(theme === "light" ? "dark" : "light")}
-      className="transition-all duration-300 ease-in-out hover:scale-110"
-    >
-      {theme === "light" ? (
-        <Moon className="h-5 w-5 transition-all duration-300 ease-in-out" />
-      ) : (
-        <Sun className="h-5 w-5 transition-all duration-300 ease-in-out text-neutral-400" />
-      )}
-    </Button>
-  );
-}
+import { useTheme } from "next-themes";
 
 // Main Component
 export default function TranscriptionApp() {
   const router = useRouter();
   const { user, token, isLoading: authLoading, logout, authFetch } = useAuth();
+  const { setTheme, resolvedTheme } = useTheme();
+  const [themeMounted, setThemeMounted] = useState(false);
+  useEffect(() => setThemeMounted(true), []);
 
   useEffect(() => {
     if (!authLoading && !token) {
@@ -60,7 +33,6 @@ export default function TranscriptionApp() {
   const [completedTranscriptions, setCompletedTranscriptions] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [theme, setTheme] = useState('light');
 
   // Fetch stats through the backend (authenticated) — this used to call
   // Qdrant directly from the browser with no login required at all,
@@ -110,7 +82,11 @@ export default function TranscriptionApp() {
     window.location.href = "/Transcripts";
   };
 
-  const isDark = theme === 'dark';
+  // themeMounted guards against a server/client mismatch — next-themes
+  // can't know the persisted theme until after hydration, same as every
+  // other page's ThemeToggle. Before that, default to light rather than
+  // flashing dark then correcting.
+  const isDark = themeMounted && resolvedTheme === 'dark';
 
   return (
     <div className={`min-h-screen transition-colors duration-300 ease-in-out ${isDark ? 'bg-neutral-900' : 'bg-stone-200'
@@ -139,16 +115,27 @@ export default function TranscriptionApp() {
                 <ShieldCheck className={`h-5 w-5 ${isDark ? 'text-neutral-300' : 'text-neutral-700'}`} />
               </Button>
             )}
+            {user && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => (window.location.href = "/Account")}
+                title="Account Settings"
+                className="transition-all duration-300 ease-in-out hover:scale-110"
+              >
+                <UserCog className={`h-5 w-5 ${isDark ? 'text-neutral-300' : 'text-neutral-700'}`} />
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => setTheme(theme === "light" ? "dark" : "light")}
+              onClick={() => setTheme(isDark ? "light" : "dark")}
               className="transition-all duration-300 ease-in-out hover:scale-110"
             >
-              {theme === "light" ? (
-                <Moon className="h-5 w-5 transition-all duration-300 ease-in-out text-stone-700" />
-              ) : (
+              {isDark ? (
                 <Sun className="h-5 w-5 transition-all duration-300 ease-in-out text-neutral-400" />
+              ) : (
+                <Moon className="h-5 w-5 transition-all duration-300 ease-in-out text-stone-700" />
               )}
             </Button>
             {user && (

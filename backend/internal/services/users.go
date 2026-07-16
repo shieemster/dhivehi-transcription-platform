@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"transcript_app/backend/internal/models"
 
@@ -14,11 +15,30 @@ import (
 var ErrUserNotFound = errors.New("user not found")
 var ErrEmailTaken = errors.New("email already registered")
 var ErrInvalidCredentials = errors.New("invalid email or password")
+var ErrWeakPassword = errors.New("password must be at least 8 characters")
+
+const minPasswordLength = 8
+
+// validatePasswordPolicy is deliberately just a length floor rather than
+// forced complexity rules (uppercase/digit/symbol requirements) — those are
+// well-documented to push users toward predictable substitutions (e.g.
+// "Password1!") without meaningfully raising guess resistance, whereas
+// length is the single strongest lever against brute force.
+func validatePasswordPolicy(password string) error {
+	if len(password) < minPasswordLength {
+		return ErrWeakPassword
+	}
+	return nil
+}
 
 // CreateUser hashes the password with bcrypt and inserts a new user under
 // the given role name (must be one of the four seeded roles). It never
 // stores or returns the plaintext password.
 func CreateUser(ctx context.Context, email, displayName, plainPassword, roleName string) (*models.User, error) {
+	if err := validatePasswordPolicy(plainPassword); err != nil {
+		return nil, err
+	}
+
 	hash, err := bcrypt.GenerateFromPassword([]byte(plainPassword), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hash password: %w", err)
@@ -70,6 +90,67 @@ func GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
 func VerifyPassword(u *models.User, plainPassword string) error {
 	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(plainPassword)); err != nil {
 		return ErrInvalidCredentials
+	}
+	return nil
+}
+
+// ChangePassword verifies the caller's current password, enforces the
+// password policy on the new one, and — since a leaked/stolen token is
+// exactly the scenario a password change is meant to recover from —
+// invalidates every existing session for this account via
+// InvalidateAllSessions, including the one making this request. The caller
+// (handler) should treat a successful response like a forced logout.
+func ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
+	var passwordHash string
+	if err := DB.QueryRow(ctx, `SELECT password_hash FROM users WHERE id = $1`, userID).Scan(&passwordHash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("failed to fetch user: %w", err)
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(currentPassword)); err != nil {
+		return ErrInvalidCredentials
+	}
+
+	if err := validatePasswordPolicy(newPassword); err != nil {
+		return err
+	}
+
+	newHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash new password: %w", err)
+	}
+
+	if _, err := DB.Exec(ctx, `UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`, string(newHash), userID); err != nil {
+		return fmt.Errorf("failed to update password: %w", err)
+	}
+
+	return InvalidateAllSessions(ctx, userID)
+}
+
+// GetSessionsValidAfter returns the timestamp before which any JWT issued
+// to this user is treated as revoked — see InvalidateAllSessions.
+func GetSessionsValidAfter(ctx context.Context, userID string) (time.Time, error) {
+	var t time.Time
+	if err := DB.QueryRow(ctx, `SELECT sessions_valid_after FROM users WHERE id = $1`, userID).Scan(&t); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, ErrUserNotFound
+		}
+		return time.Time{}, fmt.Errorf("failed to fetch session epoch: %w", err)
+	}
+	return t, nil
+}
+
+// InvalidateAllSessions immediately revokes every JWT previously issued to
+// this user — used by ChangePassword and the self-service "log out
+// everywhere" endpoint. Unlike RevokeJWT (which blocklists one specific
+// token by its JTI in Redis), this doesn't need to know which tokens
+// exist: moving the epoch forward means ParseJWT rejects anything whose
+// iat predates this call, covering every session at once.
+func InvalidateAllSessions(ctx context.Context, userID string) error {
+	if _, err := DB.Exec(ctx, `UPDATE users SET sessions_valid_after = now() WHERE id = $1`, userID); err != nil {
+		return fmt.Errorf("failed to invalidate sessions: %w", err)
 	}
 	return nil
 }

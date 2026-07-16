@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
-import { Upload, FileText, X, Moon, Sun, Check } from "lucide-react";
+import { Upload, FileText, X, Moon, Sun, Check, Loader2, AlertCircle } from "lucide-react";
 import { useTheme } from "next-themes";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
@@ -83,10 +83,14 @@ function NewTranscriptPage() {
   const [referenceNumber, setReferenceNumber] = useState("");
   const [notes, setNotes] = useState("");
   const [speakers, setSpeakers] = useState([5]);
-  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
+  type FileStatus = 'pending' | 'uploading' | 'success' | 'error';
+  const [fileStatuses, setFileStatuses] = useState<FileStatus[]>([]);
+  const [fileErrors, setFileErrors] = useState<(string | null)[]>([]);
   const [dragActive, setDragActive] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [isNavigating, setIsNavigating] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [notification, setNotification] = useState<{
     show: boolean;
     message: string;
@@ -109,7 +113,7 @@ function NewTranscriptPage() {
             type: fileData.type,
             lastModified: fileData.lastModified
           });
-          setUploadedFile(file);
+          addFiles([file]);
 
           sessionStorage.removeItem('uploadedFileData');
           sessionStorage.removeItem('uploadedFileContent');
@@ -130,6 +134,13 @@ function NewTranscriptPage() {
     cat.label.toLowerCase().includes(searchValue.toLowerCase())
   );
 
+  const addFiles = (files: File[]) => {
+    if (files.length === 0) return;
+    setUploadedFiles(prev => [...prev, ...files]);
+    setFileStatuses(prev => [...prev, ...files.map(() => 'pending' as FileStatus)]);
+    setFileErrors(prev => [...prev, ...files.map(() => null)]);
+  };
+
   const handleDrag = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
@@ -145,103 +156,109 @@ function NewTranscriptPage() {
     e.stopPropagation();
     setDragActive(false);
 
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      setUploadedFile(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files) {
+      addFiles(Array.from(e.dataTransfer.files));
     }
   };
 
   const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setUploadedFile(e.target.files[0]);
+    if (e.target.files) {
+      addFiles(Array.from(e.target.files));
     }
+    e.target.value = ''; // allow re-selecting the same file(s) again later
   };
 
-  const handleRemoveFile = () => {
-    setUploadedFile(null);
+  const handleRemoveFile = (index: number) => {
+    setUploadedFiles(prev => prev.filter((_, i) => i !== index));
+    setFileStatuses(prev => prev.filter((_, i) => i !== index));
+    setFileErrors(prev => prev.filter((_, i) => i !== index));
   };
 
+  // Uploads every selected file sequentially (not in parallel) against the
+  // existing single-file /upload endpoint — the pipeline's Redis queue
+  // processes one conversion job at a time per worker anyway, and
+  // sequential uploads make per-file progress easy to show without any
+  // backend changes for batching.
   const handleSubmit = async () => {
-    if (!uploadedFile) {
+    if (uploadedFiles.length === 0) {
       setNotification({
         show: true,
-        message: "Please upload a file first.",
+        message: "Please add at least one file first.",
         type: 'warning'
       });
       return;
     }
 
-    const formData = new FormData();
-    formData.append("file", uploadedFile);
-    formData.append("category", category);
-    formData.append("reference_number", referenceNumber);
-    formData.append("notes", notes);
-    formData.append("speakers", Math.floor(speakers[0]).toString());
+    setIsSubmitting(true);
+    const jobIds: string[] = [];
+    let failureCount = 0;
 
-    try {
-      const res = await authFetch(`${BACKEND_URL}/upload`, {
-        method: "POST",
-        body: formData,
-      });
+    for (let i = 0; i < uploadedFiles.length; i++) {
+      setFileStatuses(prev => prev.map((s, idx) => (idx === i ? 'uploading' : s)));
 
-      if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(errorText || "Failed to upload");
-      }
+      const formData = new FormData();
+      formData.append("file", uploadedFiles[i]);
+      formData.append("category", category);
+      formData.append("reference_number", referenceNumber);
+      formData.append("notes", notes);
+      formData.append("speakers", Math.floor(speakers[0]).toString());
 
-      // Try to parse response, but handle if it's empty or not JSON
-      let data: any = {};
-      const contentType = res.headers.get("content-type");
-
-      if (contentType && contentType.includes("application/json")) {
-        const text = await res.text();
-        if (text) {
-          data = JSON.parse(text);
-        }
-      }
-
-      console.log("Upload response:", data);
-      console.log("Response headers:", Object.fromEntries(res.headers.entries()));
-
-      // Extract job_id from response - try different possible formats
-      const uploadedJobId = data.job_id || data.jobId || data.id || data.Job_ID || data.message?.job_id;
-
-      if (!uploadedJobId) {
-        console.warn("No job_id found in response. Server may return job_id separately or you need to fetch the most recent transcript.");
-
-        // Show success and navigate to list page
-        setNotification({
-          show: true,
-          message: "Audio uploaded successfully! View in transcripts list.",
-          type: 'success'
+      try {
+        const res = await authFetch(`${BACKEND_URL}/upload`, {
+          method: "POST",
+          body: formData,
         });
 
-        setTimeout(() => {
-          setIsNavigating(true);
-          router.push('/Transcripts/List');
-        }, 2000);
-        return;
-      }
+        if (!res.ok) {
+          const errorText = await res.text();
+          throw new Error(errorText || "Failed to upload");
+        }
 
+        let data: any = {};
+        const contentType = res.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          const text = await res.text();
+          if (text) data = JSON.parse(text);
+        }
+
+        const uploadedJobId = data.job_id || data.jobId || data.id || data.Job_ID || data.message?.job_id;
+        if (uploadedJobId) jobIds.push(uploadedJobId);
+
+        setFileStatuses(prev => prev.map((s, idx) => (idx === i ? 'success' : s)));
+      } catch (error) {
+        failureCount++;
+        setFileStatuses(prev => prev.map((s, idx) => (idx === i ? 'error' : s)));
+        setFileErrors(prev => prev.map((e, idx) => (idx === i ? (error instanceof Error ? error.message : 'Upload failed') : e)));
+      }
+    }
+
+    setIsSubmitting(false);
+
+    if (failureCount === 0) {
       setNotification({
         show: true,
-        message: "Audio uploaded successfully! Redirecting to details...",
+        message: uploadedFiles.length === 1
+          ? "Audio uploaded successfully! Redirecting to details..."
+          : `All ${uploadedFiles.length} files uploaded successfully! Redirecting to list...`,
         type: 'success'
       });
-
-      // Navigate to details page with the job_id after 1.5 seconds
-      setTimeout(() => {
-        setIsNavigating(true);
-        router.push(`/Transcripts/Details?job_id=${uploadedJobId}`);
-      }, 1500);
-
-    } catch (error) {
-      console.error("Upload failed:", error);
+    } else {
       setNotification({
         show: true,
-        message: error instanceof Error ? error.message : "Upload failed. Please try again.",
-        type: 'error'
+        message: `${uploadedFiles.length - failureCount} of ${uploadedFiles.length} uploaded — ${failureCount} failed. See file list for details.`,
+        type: failureCount === uploadedFiles.length ? 'error' : 'warning'
       });
+      return; // let the user see which files failed rather than navigating away
     }
+
+    setTimeout(() => {
+      setIsNavigating(true);
+      if (jobIds.length === 1) {
+        router.push(`/Transcripts/Details?job_id=${jobIds[0]}`);
+      } else {
+        router.push('/Transcripts/List');
+      }
+    }, 1500);
   };
 
   const handleCancel = () => {
@@ -441,70 +458,96 @@ function NewTranscriptPage() {
                 </div>
               </div>
 
-              {/* Uploaded File Display or Upload Area */}
+              {/* Uploaded Files Display + Upload Area */}
               <div className="space-y-2">
                 <Label className="text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
-                  Audio/Video File {uploadedFile && <span className="text-green-600 dark:text-green-400">(Uploaded)</span>}
+                  Audio/Video File(s) {uploadedFiles.length > 0 && (
+                    <span className="text-green-600 dark:text-green-400">
+                      ({uploadedFiles.length} selected)
+                    </span>
+                  )}
                 </Label>
 
-                {uploadedFile ? (
-                  <div className="flex items-center gap-4 p-4 bg-stone-50 dark:bg-neutral-700/50 border border-stone-300 dark:border-neutral-600 rounded-lg transition-all duration-500 ease-in-out">
-                    <div className="bg-stone-100 dark:bg-neutral-900/50 p-3 rounded-lg transition-colors duration-500 ease-in-out">
-                      <FileText className="w-6 h-6 text-stone-400 dark:text-neutral-400 transition-colors duration-500 ease-in-out" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="font-medium text-stone-900 dark:text-white truncate transition-colors duration-500 ease-in-out">
-                        {uploadedFile.name}
-                      </p>
-                      <p className="text-sm text-stone-500 dark:text-neutral-400 transition-colors duration-500 ease-in-out">
-                        {(uploadedFile.size / (1024 * 1024)).toFixed(2)} MB
-                      </p>
-                    </div>
-                    <Button
-                      onClick={handleRemoveFile}
-                      variant="ghost"
-                      size="icon"
-                      className="text-stone-600 hover:text-stone-900 dark:text-neutral-400 dark:hover:text-white transition-all duration-500 ease-in-out hover:scale-110"
-                    >
-                      <X className="w-5 h-5" />
-                    </Button>
-                  </div>
-                ) : (
-                  <div
-                    className={`border-2 border-dashed rounded-lg p-8 text-center transition-all duration-500 ease-in-out ${dragActive
-                      ? "border-stone-500 bg-stone-100 dark:border-neutral-400 dark:bg-neutral-950/50 scale-105"
-                      : "border-stone-300 bg-stone-50 dark:border-neutral-600 dark:bg-neutral-700/50"
-                      }`}
-                    onDragEnter={handleDrag}
-                    onDragLeave={handleDrag}
-                    onDragOver={handleDrag}
-                    onDrop={handleDrop}
-                  >
-                    <Upload className="w-12 h-12 mx-auto mb-3 text-stone-400 dark:text-neutral-500 transition-colors duration-500 ease-in-out" />
-                    <p className="text-stone-700 dark:text-white mb-2 transition-colors duration-500 ease-in-out">
-                      Drop your file here
-                    </p>
-                    <p className="text-sm text-stone-500 dark:text-neutral-400 mb-3 transition-colors duration-500 ease-in-out">
-                      or click to browse
-                    </p>
-                    <input
-                      type="file"
-                      id="additional-file"
-                      className="hidden"
-                      onChange={handleFileInput}
-                      accept="audio/*,video/*"
-                    />
-                    <label htmlFor="additional-file">
-                      <Button
-                        type="button"
-                        onClick={() => document.getElementById('additional-file')?.click()}
-                        className="bg-neutral-600 hover:bg-neutral-700 dark:bg-neutral-400 dark:hover:bg-neutral-500 transition-all duration-500 ease-in-out hover:scale-105"
-                      >
-                        Browse Files
-                      </Button>
-                    </label>
+                {uploadedFiles.length > 0 && (
+                  <div className="space-y-2 mb-2">
+                    {uploadedFiles.map((file, index) => {
+                      const status = fileStatuses[index];
+                      return (
+                        <div
+                          key={`${file.name}-${index}`}
+                          className="flex items-center gap-4 p-4 bg-stone-50 dark:bg-neutral-700/50 border border-stone-300 dark:border-neutral-600 rounded-lg transition-all duration-500 ease-in-out"
+                        >
+                          <div className="bg-stone-100 dark:bg-neutral-900/50 p-3 rounded-lg transition-colors duration-500 ease-in-out">
+                            <FileText className="w-6 h-6 text-stone-400 dark:text-neutral-400 transition-colors duration-500 ease-in-out" />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="font-medium text-stone-900 dark:text-white truncate transition-colors duration-500 ease-in-out">
+                              {file.name}
+                            </p>
+                            <p className="text-sm text-stone-500 dark:text-neutral-400 transition-colors duration-500 ease-in-out">
+                              {(file.size / (1024 * 1024)).toFixed(2)} MB
+                            </p>
+                            {status === 'error' && fileErrors[index] && (
+                              <p className="text-xs text-red-600 dark:text-red-400 flex items-center gap-1 mt-1">
+                                <AlertCircle className="w-3 h-3 shrink-0" />
+                                {fileErrors[index]}
+                              </p>
+                            )}
+                          </div>
+                          {status === 'uploading' && <Loader2 className="w-5 h-5 animate-spin text-stone-500 dark:text-neutral-400" />}
+                          {status === 'success' && <Check className="w-5 h-5 text-green-600 dark:text-green-400" />}
+                          {status === 'error' && <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400" />}
+                          {(status === 'pending' || status === 'error') && (
+                            <Button
+                              onClick={() => handleRemoveFile(index)}
+                              variant="ghost"
+                              size="icon"
+                              className="text-stone-600 hover:text-stone-900 dark:text-neutral-400 dark:hover:text-white transition-all duration-500 ease-in-out hover:scale-110"
+                            >
+                              <X className="w-5 h-5" />
+                            </Button>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
+
+                <div
+                  className={`border-2 border-dashed rounded-lg p-8 text-center transition-all duration-500 ease-in-out ${dragActive
+                    ? "border-stone-500 bg-stone-100 dark:border-neutral-400 dark:bg-neutral-950/50 scale-105"
+                    : "border-stone-300 bg-stone-50 dark:border-neutral-600 dark:bg-neutral-700/50"
+                    }`}
+                  onDragEnter={handleDrag}
+                  onDragLeave={handleDrag}
+                  onDragOver={handleDrag}
+                  onDrop={handleDrop}
+                >
+                  <Upload className="w-12 h-12 mx-auto mb-3 text-stone-400 dark:text-neutral-500 transition-colors duration-500 ease-in-out" />
+                  <p className="text-stone-700 dark:text-white mb-2 transition-colors duration-500 ease-in-out">
+                    Drop file(s) here
+                  </p>
+                  <p className="text-sm text-stone-500 dark:text-neutral-400 mb-3 transition-colors duration-500 ease-in-out">
+                    or click to browse — you can select multiple files at once
+                  </p>
+                  <input
+                    type="file"
+                    id="additional-file"
+                    className="hidden"
+                    onChange={handleFileInput}
+                    accept="audio/*,video/*"
+                    multiple
+                  />
+                  <label htmlFor="additional-file">
+                    <Button
+                      type="button"
+                      onClick={() => document.getElementById('additional-file')?.click()}
+                      className="bg-neutral-600 hover:bg-neutral-700 dark:bg-neutral-400 dark:hover:bg-neutral-500 transition-all duration-500 ease-in-out hover:scale-105"
+                    >
+                      Browse Files
+                    </Button>
+                  </label>
+                </div>
               </div>
 
               {/* Submit Button */}
@@ -518,10 +561,19 @@ function NewTranscriptPage() {
                 </Button>
                 <Button
                   onClick={handleSubmit}
-                  disabled={!uploadedFile}
+                  disabled={uploadedFiles.length === 0 || isSubmitting}
                   className="flex-1 bg-stone-600 hover:bg-stone-700 dark:bg-neutral-700 dark:hover:bg-neutral-600 text-white transition-all duration-500 ease-in-out hover:scale-105 hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  Submit Transcript
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      Uploading...
+                    </>
+                  ) : uploadedFiles.length > 1 ? (
+                    `Submit ${uploadedFiles.length} Files`
+                  ) : (
+                    'Submit Transcript'
+                  )}
                 </Button>
               </div>
             </CardContent>

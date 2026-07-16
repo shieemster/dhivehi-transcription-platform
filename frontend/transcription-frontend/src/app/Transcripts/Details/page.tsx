@@ -28,12 +28,15 @@ import {
   Loader2,
   Check,
   Sparkles,
-  FileDown
+  FileDown,
+  Pencil,
+  X
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import PdfExportModal from "@/components/PdfExportModal";
 import { generateTranscriptPdf } from "@/lib/pdfGenerator";
 import type { PdfAnalysisData } from "@/lib/pdfGenerator";
+import { exportTranscript, type PlainExportFormat } from "@/lib/exportFormats";
 
 export default function TranscriptDetails() {
   return (
@@ -79,6 +82,7 @@ interface Segment {
   id: string;
   segment_index: number;
   speaker: string;
+  speaker_display_name: string;
   start_time: number;
   end_time: number;
   minio_url: string;
@@ -87,6 +91,13 @@ interface Segment {
   timestamp: string;
   status: string;
   point_id?: string | number;
+}
+
+interface RelatedTranscript {
+  job_id: string;
+  filename: string;
+  reference_number: string;
+  match_reasons: string[];
 }
 
 interface ParentTranscript {
@@ -134,6 +145,24 @@ function TranscriptDetailsPage() {
   const [exportLoading, setExportLoading] = useState(false);
   const [analysisPdfData, setAnalysisPdfData] = useState<PdfAnalysisData | null>(null);
 
+  const [relatedTranscripts, setRelatedTranscripts] = useState<RelatedTranscript[]>([]);
+
+  const [editingSpeaker, setEditingSpeaker] = useState<string | null>(null);
+  const [speakerNameInput, setSpeakerNameInput] = useState('');
+  const [renamingSpeaker, setRenamingSpeaker] = useState(false);
+
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+
+  const handlePlainExport = (format: PlainExportFormat) => {
+    if (!parent) return;
+    exportTranscript(
+      format,
+      segments.map(s => ({ ...s, transcript_text: editedTexts[s.id] || s.transcript_text })),
+      parent.filename
+    );
+    setExportMenuOpen(false);
+  };
+
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const progressIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const audioObjectUrlRef = useRef<string | null>(null);
@@ -152,6 +181,28 @@ function TranscriptDetailsPage() {
   }, [jobId, token, authLoading]);
 
   useEffect(() => {
+    if (!token || !jobId) return;
+    apiFetch<RelatedTranscript[]>(authFetch, `${BACKEND_URL}/transcripts/${jobId}/related`)
+      .then(data => setRelatedTranscripts(data ?? []))
+      .catch(() => setRelatedTranscripts([])); // non-critical — just don't show the section
+  }, [token, jobId, authFetch]);
+
+  // Poll quietly while the pipeline hasn't finished, so convert -> diarize
+  // -> transcribe progress shows up without a manual reload. "transcribed"
+  // is the only reliably-set terminal status the pipeline actually uses
+  // (see gradio/transcription/transcription.py) — anything else is worth
+  // continuing to check.
+  useEffect(() => {
+    if (!token || !jobId || !parent) return;
+    if (parent.status === 'transcribed' || parent.status === 'error') return;
+
+    const interval = setInterval(() => {
+      fetchTranscriptData({ background: true });
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [token, jobId, parent?.status]);
+
+  useEffect(() => {
     return () => {
       if (audioRef.current) {
         audioRef.current.pause();
@@ -168,10 +219,12 @@ function TranscriptDetailsPage() {
     };
   }, []);
 
-  const fetchTranscriptData = async () => {
+  const fetchTranscriptData = async (opts: { background?: boolean } = {}) => {
     try {
-      setLoading(true);
-      setError(null);
+      if (!opts.background) {
+        setLoading(true);
+        setError(null);
+      }
 
       const parentPayload = await apiFetch<any>(authFetch, `${BACKEND_URL}/transcripts/${jobId}`);
 
@@ -204,6 +257,7 @@ function TranscriptDetailsPage() {
         point_id: `segment-${s.segment_index}`,
         segment_index: s.segment_index,
         speaker: s.speaker,
+        speaker_display_name: s.speaker_display_name || '',
         start_time: s.start_time,
         end_time: s.end_time,
         minio_url: '', // no longer used directly — playback fetches the audio endpoint as a blob
@@ -215,13 +269,22 @@ function TranscriptDetailsPage() {
 
       setSegments(transformedSegments);
 
-      const initialTexts: { [key: string]: string } = {};
-      transformedSegments.forEach((seg: Segment) => {
-        initialTexts[seg.id] = seg.transcript_text;
+      // On a background poll, don't clobber text the user may be actively
+      // editing in a segment that already finished transcribing while
+      // others are still in progress — only fill in segments we haven't
+      // seen text for yet.
+      setEditedTexts(prev => {
+        const next = opts.background ? { ...prev } : {};
+        transformedSegments.forEach((seg: Segment) => {
+          if (!(seg.id in next)) {
+            next[seg.id] = seg.transcript_text;
+          }
+        });
+        return next;
       });
-      setEditedTexts(initialTexts);
 
     } catch (err) {
+      if (opts.background) return; // a failed background poll shouldn't disrupt the visible page
       console.error("Failed to fetch transcript data:", err);
       if (err instanceof ApiError && err.status === 401) {
         router.push("/login");
@@ -229,7 +292,9 @@ function TranscriptDetailsPage() {
       }
       setError(err instanceof Error ? err.message : 'Failed to load transcript');
     } finally {
-      setLoading(false);
+      if (!opts.background) {
+        setLoading(false);
+      }
     }
   };
 
@@ -321,6 +386,37 @@ function TranscriptDetailsPage() {
         newSet.delete(segmentId);
         return newSet;
       });
+    }
+  };
+
+  const handleRenameSpeaker = async (speakerLabel: string) => {
+    const displayName = speakerNameInput.trim();
+    if (!displayName) return;
+
+    try {
+      setRenamingSpeaker(true);
+      // Diarization assigns the same raw label (e.g. "SPEAKER_00") to every
+      // segment from that speaker, so one rename call applies to all of
+      // them at once — reflect that locally instead of refetching.
+      await apiFetch(
+        authFetch,
+        `${BACKEND_URL}/transcripts/${jobId}/speakers/${encodeURIComponent(speakerLabel)}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ display_name: displayName }),
+        }
+      );
+
+      setSegments(prev =>
+        prev.map(s => (s.speaker === speakerLabel ? { ...s, speaker_display_name: displayName } : s))
+      );
+      setEditingSpeaker(null);
+      setSpeakerNameInput('');
+    } catch (err) {
+      alert(`Failed to rename speaker: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setRenamingSpeaker(false);
     }
   };
 
@@ -629,9 +725,30 @@ function TranscriptDetailsPage() {
                 <CardTitle className="text-2xl text-neutral-900 dark:text-white mb-2">
                   {parent.filename}
                 </CardTitle>
-                <Badge className={`${getStatusColor(parent.status)} font-medium`}>
+                <Badge className={`${getStatusColor(parent.status)} font-medium flex items-center gap-1 w-fit`}>
+                  {parent.status !== 'transcribed' && parent.status !== 'error' && (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  )}
                   {parent.status.toUpperCase()}
                 </Badge>
+                {parent.status !== 'transcribed' && parent.status !== 'error' && segments.length > 0 && (() => {
+                  const done = segments.filter(s => s.status === 'transcribed').length;
+                  const pct = Math.round((done / segments.length) * 100);
+                  return (
+                    <div className="mt-3 max-w-xs">
+                      <div className="flex justify-between text-xs text-stone-500 dark:text-neutral-400 mb-1">
+                        <span>{done} of {segments.length} segments transcribed</span>
+                        <span>{pct}%</span>
+                      </div>
+                      <div className="w-full bg-stone-200 dark:bg-neutral-700 rounded-full h-1.5 overflow-hidden">
+                        <div
+                          className="bg-stone-600 dark:bg-neutral-400 h-full transition-all duration-500 ease-out"
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
               <div className="flex items-center gap-2">
                 {parent.status === "transcribed" && (
@@ -655,6 +772,35 @@ function TranscriptDetailsPage() {
                     <FileDown className="w-4 h-4 mr-2" />
                     Export PDF
                   </Button>
+                )}
+                {segments.length > 0 && (
+                  <div className="relative">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setExportMenuOpen(prev => !prev)}
+                      className="bg-stone-50 hover:bg-stone-200 dark:bg-neutral-700 dark:hover:bg-neutral-600 transition-all duration-300 hover:scale-105"
+                    >
+                      <FileDown className="w-4 h-4 mr-2" />
+                      Export...
+                    </Button>
+                    {exportMenuOpen && (
+                      <>
+                        <div className="fixed inset-0 z-10" onClick={() => setExportMenuOpen(false)} />
+                        <div className="absolute right-0 mt-1 w-40 rounded-lg border border-stone-200 dark:border-neutral-700 bg-white dark:bg-neutral-800 shadow-lg z-20 overflow-hidden">
+                          {(["srt", "vtt", "txt", "csv"] as PlainExportFormat[]).map(fmt => (
+                            <button
+                              key={fmt}
+                              onClick={() => handlePlainExport(fmt)}
+                              className="w-full text-left px-4 py-2 text-sm text-stone-700 dark:text-neutral-200 hover:bg-stone-100 dark:hover:bg-neutral-700 uppercase"
+                            >
+                              {fmt}
+                            </button>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </div>
                 )}
                 <Button
                   variant="outline"
@@ -768,9 +914,58 @@ function TranscriptDetailsPage() {
                             <Badge className="bg-stone-600 dark:bg-neutral-600 text-white">
                               #{segment.segment_index}
                             </Badge>
-                            <span className="font-semibold text-stone-900 dark:text-white">
-                              {segment.speaker}
-                            </span>
+                            {editingSpeaker === segment.speaker ? (
+                              <div className="flex items-center gap-1">
+                                <input
+                                  autoFocus
+                                  value={speakerNameInput}
+                                  onChange={(e) => setSpeakerNameInput(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      e.preventDefault();
+                                      handleRenameSpeaker(segment.speaker);
+                                    } else if (e.key === 'Escape') {
+                                      setEditingSpeaker(null);
+                                      setSpeakerNameInput('');
+                                    }
+                                  }}
+                                  placeholder={segment.speaker}
+                                  className="text-sm font-semibold bg-white dark:bg-neutral-800 border border-stone-300 dark:border-neutral-600 rounded px-2 py-0.5 w-32"
+                                />
+                                <Button
+                                  size="icon"
+                                  variant="ghost"
+                                  className="h-6 w-6"
+                                  disabled={renamingSpeaker}
+                                  onClick={() => handleRenameSpeaker(segment.speaker)}
+                                >
+                                  <Check className="w-3 h-3" />
+                                </Button>
+                                <Button
+                                  size="icon"
+                                  variant="ghost"
+                                  className="h-6 w-6"
+                                  onClick={() => {
+                                    setEditingSpeaker(null);
+                                    setSpeakerNameInput('');
+                                  }}
+                                >
+                                  <X className="w-3 h-3" />
+                                </Button>
+                              </div>
+                            ) : (
+                              <span
+                                className="font-semibold text-stone-900 dark:text-white group inline-flex items-center gap-1 cursor-pointer"
+                                onClick={() => {
+                                  setEditingSpeaker(segment.speaker);
+                                  setSpeakerNameInput(segment.speaker_display_name || '');
+                                }}
+                                title="Click to rename speaker"
+                              >
+                                {segment.speaker_display_name || segment.speaker}
+                                <Pencil className="w-3 h-3 opacity-0 group-hover:opacity-50" />
+                              </span>
+                            )}
                             <span className="text-sm text-stone-500 dark:text-neutral-400">
                               {formatTime(segment.start_time)} - {formatTime(segment.end_time)}
                             </span>
@@ -832,6 +1027,38 @@ function TranscriptDetailsPage() {
             )}
           </CardContent>
         </Card>
+
+        {relatedTranscripts.length > 0 && (
+          <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700 mt-6">
+            <CardHeader>
+              <CardTitle className="text-lg text-neutral-900 dark:text-white flex items-center gap-2">
+                <Hash className="w-5 h-5" />
+                Related Transcripts ({relatedTranscripts.length})
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {relatedTranscripts.map((r) => (
+                <div
+                  key={r.job_id}
+                  onClick={() => router.push(`/Transcripts/Details?job_id=${r.job_id}`)}
+                  className="p-3 rounded-lg bg-stone-50 dark:bg-neutral-700/50 hover:bg-stone-200 dark:hover:bg-neutral-700 cursor-pointer transition-colors"
+                >
+                  <p className="font-medium text-stone-900 dark:text-white">{r.filename}</p>
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {r.match_reasons.map((reason, i) => (
+                      <Badge
+                        key={i}
+                        className="bg-stone-200 text-stone-700 dark:bg-neutral-600 dark:text-neutral-200 text-xs"
+                      >
+                        {reason}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </CardContent>
+          </Card>
+        )}
 
         <PdfExportModal
           open={exportModalOpen}

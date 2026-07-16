@@ -80,6 +80,17 @@ export default function TranscriptList() {
   const [error, setError] = useState<string | null>(null);
   const [transcripts, setTranscripts] = useState<Transcript[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
+  interface ContentMatch {
+    job_id: string;
+    filename: string;
+    segment_index: number;
+    speaker: string;
+    speaker_display_name?: string;
+    start_time: number;
+    transcript_text: string;
+  }
+  const [contentMatches, setContentMatches] = useState<ContentMatch[]>([]);
+  const [searchingContent, setSearchingContent] = useState(false);
   const [filterCategory, setFilterCategory] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set());
@@ -98,14 +109,70 @@ export default function TranscriptList() {
     }
   }, [token]);
 
+  // Debounced content search — the searchQuery box above already filters
+  // the already-loaded list by filename/reference number instantly; this
+  // additionally asks the backend to search actual transcript TEXT across
+  // every segment the caller can see, answering "which recording mentioned
+  // X" rather than just "which file is named X".
+  useEffect(() => {
+    if (!token || searchQuery.trim().length < 2) {
+      setContentMatches([]);
+      return;
+    }
 
-  const fetchTranscripts = async () => {
+    const handle = setTimeout(async () => {
+      try {
+        setSearchingContent(true);
+        const response = await authFetch(
+          `${BACKEND_URL}/transcripts/search?q=${encodeURIComponent(searchQuery.trim())}`
+        );
+        if (!response.ok) {
+          setContentMatches([]);
+          return;
+        }
+        const data = await response.json();
+        setContentMatches(data ?? []);
+      } catch {
+        setContentMatches([]);
+      } finally {
+        setSearchingContent(false);
+      }
+    }, 400);
+
+    return () => clearTimeout(handle);
+  }, [token, searchQuery, authFetch]);
+
+  // The pipeline only ever sets a handful of status strings in practice
+  // ("uploaded", "diarized", "transcribed" — see backend/upload.go and the
+  // gradio workers), so rather than hardcode that specific list, anything
+  // that isn't a known terminal/failure state is treated as still in
+  // progress and worth polling for.
+  const TERMINAL_STATUSES = ["transcribed", "completed", "error", "failed"];
+  const isActiveStatus = (status: string) => !TERMINAL_STATUSES.includes(status);
+
+  // Background polling while any job hasn't reached a terminal status, so a
+  // job moving from "uploaded" through the pipeline shows up without a
+  // manual page reload. Silent (no loading spinner) — see fetchTranscripts
+  // for the initial/user-triggered load, which does show one.
+  useEffect(() => {
+    if (!token) return;
+    if (!transcripts.some(t => isActiveStatus(t.status))) return;
+
+    const interval = setInterval(() => {
+      fetchTranscripts({ background: true });
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [token, transcripts]);
+
+  const fetchTranscripts = async (opts: { background?: boolean } = {}) => {
     if (fetchingRef.current) return;
     fetchingRef.current = true;
 
     try {
-      setLoading(true);
-      setError(null);
+      if (!opts.background) {
+        setLoading(true);
+        setError(null);
+      }
 
       const response = await authFetch(`${BACKEND_URL}/transcripts`);
 
@@ -136,11 +203,17 @@ export default function TranscriptList() {
 
       setTranscripts(transformed);
     } catch (err) {
-      console.error("Failed to fetch transcripts:", err);
-      setError(err instanceof Error ? err.message : 'Failed to load transcripts');
+      if (!opts.background) {
+        console.error("Failed to fetch transcripts:", err);
+        setError(err instanceof Error ? err.message : 'Failed to load transcripts');
+      }
+      // background polling failures are silent — the visible list just
+      // stays as it was until the next successful poll
     } finally {
       fetchingRef.current = false;
-      setLoading(false);
+      if (!opts.background) {
+        setLoading(false);
+      }
     }
   };
 
@@ -360,6 +433,44 @@ export default function TranscriptList() {
           </CardContent>
         </Card>
 
+        {searchQuery.trim().length >= 2 && (
+          <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700 mb-6">
+            <CardHeader>
+              <CardTitle className="text-base text-neutral-900 dark:text-white flex items-center gap-2">
+                <Search className="w-4 h-4" />
+                Content matches for &ldquo;{searchQuery}&rdquo;
+                {searchingContent && <Loader2 className="w-4 h-4 animate-spin text-stone-500 dark:text-neutral-400" />}
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {contentMatches.length === 0 ? (
+                <p className="text-sm text-stone-500 dark:text-neutral-400">
+                  {searchingContent ? "Searching transcript content..." : "No matches found in any transcript's spoken content."}
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {contentMatches.map((m, i) => (
+                    <div
+                      key={`${m.job_id}-${m.segment_index}-${i}`}
+                      onClick={() => router.push(`/Transcripts/Details?job_id=${m.job_id}`)}
+                      className="p-3 rounded-lg bg-stone-50 dark:bg-neutral-700/50 hover:bg-stone-200 dark:hover:bg-neutral-700 cursor-pointer transition-colors"
+                    >
+                      <div className="flex items-center gap-2 text-xs text-stone-500 dark:text-neutral-400 mb-1">
+                        <span className="font-semibold text-stone-700 dark:text-neutral-300">{m.filename}</span>
+                        <span>· {m.speaker_display_name || m.speaker}</span>
+                        <span>· segment #{m.segment_index}</span>
+                      </div>
+                      <p className="text-sm text-stone-800 dark:text-neutral-200 font-faruma text-right" dir="rtl">
+                        {m.transcript_text}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
         <div className="space-y-4">
           {filteredTranscripts.length === 0 ? (
             <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700">
@@ -394,7 +505,8 @@ export default function TranscriptList() {
                           <h3 className="text-lg font-semibold text-neutral-900 dark:text-white">
                             {transcript.filename}
                           </h3>
-                          <Badge className={`${getStatusColor(transcript.status)} font-medium`}>
+                          <Badge className={`${getStatusColor(transcript.status)} font-medium flex items-center gap-1 w-fit`}>
+                            {isActiveStatus(transcript.status) && <Loader2 className="w-3 h-3 animate-spin" />}
                             {transcript.status.toUpperCase()}
                           </Badge>
                         </div>

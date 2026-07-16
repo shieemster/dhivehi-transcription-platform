@@ -13,3 +13,4 @@ datasets
 pyannote.audio==3.1.1
 noisereduce
 minio==7.1.0
+google-generativeai

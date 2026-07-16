@@ -75,6 +75,10 @@ func main() {
 			middleware.RequirePermission("transcript:view_own", "transcript:view_team", "transcript:view_all"),
 			handlers.TranscriptStats)
 
+		protected.GET("/transcripts/search",
+			middleware.RequirePermission("transcript:view_own", "transcript:view_team", "transcript:view_all"),
+			handlers.SearchTranscriptsHandler)
+
 		protected.GET("/files/:job_id",
 			middleware.RequirePermission("transcript:view_own", "transcript:view_team", "transcript:view_all"),
 			handlers.GetFile)
@@ -87,9 +91,17 @@ func main() {
 			middleware.RequirePermission("transcript:view_own", "transcript:view_team", "transcript:view_all"),
 			handlers.GetSegments)
 
+		protected.GET("/transcripts/:job_id/related",
+			middleware.RequirePermission("transcript:view_own", "transcript:view_team", "transcript:view_all"),
+			handlers.GetRelatedTranscriptsHandler)
+
 		protected.PATCH("/transcripts/:job_id/segments/:segment_index",
 			middleware.RequirePermission("transcript:view_own", "transcript:view_team", "transcript:view_all"),
 			handlers.UpdateSegment)
+
+		protected.PATCH("/transcripts/:job_id/speakers/:speaker_label",
+			middleware.RequirePermission("transcript:view_own", "transcript:view_team", "transcript:view_all"),
+			handlers.RenameSpeakerHandler)
 
 		protected.GET("/transcripts/:job_id/segments/:segment_index/audio",
 			middleware.RequirePermission("transcript:view_own", "transcript:view_team", "transcript:view_all"),
@@ -119,6 +131,8 @@ func main() {
 	authorized.Use(middleware.RequireAuth())
 	{
 		authorized.POST("/logout", handlers.Logout)
+		authorized.POST("/logout-all", handlers.LogoutAllSessions)
+		authorized.POST("/change-password", handlers.ChangePassword)
 		authorized.POST("/mfa/enroll/start", handlers.MFAEnrollStart)
 		authorized.POST("/mfa/enroll/confirm", handlers.MFAEnrollConfirm)
 	}

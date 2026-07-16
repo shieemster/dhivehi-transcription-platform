@@ -94,6 +94,42 @@ func ListTranscripts(c *gin.Context) {
 	c.JSON(http.StatusOK, transcripts)
 }
 
+// SearchTranscriptsHandler handles GET /transcripts/search?q=... — finds
+// every segment (across every transcript the caller is allowed to see)
+// whose text contains the query, so "which recording mentioned this
+// person/place/phrase" can actually be answered instead of only filtering
+// the already-loaded list by filename.
+func SearchTranscriptsHandler(c *gin.Context) {
+	query := c.Query("q")
+	claims := c.MustGet("claims").(*services.Claims)
+	grantedSet := c.MustGet("permissions").(map[string]bool)
+
+	results, err := services.SearchTranscripts(query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("search failed: %v", err)})
+		return
+	}
+
+	switch {
+	case grantedSet["transcript:view_all"], grantedSet["transcript:view_team"]:
+		// same known gap as ListTranscripts — view_team isn't scoped to a
+		// team yet, so it currently behaves like view_all
+		c.JSON(http.StatusOK, results)
+
+	case grantedSet["transcript:view_own"]:
+		filtered := make([]services.SearchResult, 0, len(results))
+		for _, r := range results {
+			if r.UploadedBy == claims.UserID {
+				filtered = append(filtered, r)
+			}
+		}
+		c.JSON(http.StatusOK, filtered)
+
+	default:
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to search transcripts"})
+	}
+}
+
 // TranscriptStats handles GET /transcripts/stats
 // (gin-native — this is what main.go actually registers).
 func TranscriptStats(c *gin.Context) {
@@ -158,6 +194,46 @@ func GetTranscriptDetail(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, transcript)
+}
+
+// GetRelatedTranscriptsHandler handles GET /transcripts/:job_id/related —
+// other transcripts sharing this one's case reference number, or sharing a
+// named person/location/organization/event from the analysis step.
+func GetRelatedTranscriptsHandler(c *gin.Context) {
+	jobID := c.Param("job_id")
+	claims := c.MustGet("claims").(*services.Claims)
+	grantedSet := c.MustGet("permissions").(map[string]bool)
+
+	transcript, err := services.GetTranscriptByID(jobID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "transcript not found"})
+		return
+	}
+	if !canAccessTranscript(claims, grantedSet, transcript.UploadedBy) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to view this transcript"})
+		return
+	}
+
+	related, err := services.GetRelatedTranscripts(jobID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to find related transcripts: %v", err)})
+		return
+	}
+
+	// Same row-level scoping as ListTranscripts/search — a view_own-only
+	// caller shouldn't see that a matching transcript exists at all if
+	// they can't otherwise access it.
+	if grantedSet["transcript:view_own"] && !grantedSet["transcript:view_team"] && !grantedSet["transcript:view_all"] {
+		filtered := make([]services.RelatedTranscript, 0, len(related))
+		for _, r := range related {
+			if r.UploadedBy == claims.UserID {
+				filtered = append(filtered, r)
+			}
+		}
+		related = filtered
+	}
+
+	c.JSON(http.StatusOK, related)
 }
 
 // GetSegments handles GET /transcripts/:job_id/segments.
@@ -231,6 +307,49 @@ func UpdateSegment(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "segment updated"})
+}
+
+type renameSpeakerRequest struct {
+	DisplayName string `json:"display_name" binding:"required"`
+}
+
+// RenameSpeakerHandler handles PATCH /transcripts/:job_id/speakers/:speaker_label.
+// Diarization assigns generic labels ("SPEAKER_00", "SPEAKER_01", ...) —
+// this lets a caller attach a human name, applied to every segment sharing
+// that label within this transcript in one call (see services.RenameSpeaker).
+func RenameSpeakerHandler(c *gin.Context) {
+	jobID := c.Param("job_id")
+	speakerLabel := c.Param("speaker_label")
+	claims := c.MustGet("claims").(*services.Claims)
+	grantedSet := c.MustGet("permissions").(map[string]bool)
+
+	transcript, err := services.GetTranscriptByID(jobID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "transcript not found"})
+		return
+	}
+	if !canAccessTranscript(claims, grantedSet, transcript.UploadedBy) {
+		logAccessDenied(c, claims, "transcript", jobID, "RenameSpeakerHandler")
+		c.JSON(http.StatusForbidden, gin.H{"error": "you do not have permission to edit this transcript"})
+		return
+	}
+
+	var req renameSpeakerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "display_name is required"})
+		return
+	}
+
+	if err := services.RenameSpeaker(jobID, speakerLabel, req.DisplayName); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to rename speaker: %v", err)})
+		return
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "speaker_renamed", "transcript", jobID, c.ClientIP(), map[string]interface{}{"speaker": speakerLabel, "display_name": req.DisplayName}); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "speaker renamed"})
 }
 
 // GetSegmentAudio handles GET /transcripts/:job_id/segments/:segment_index/audio

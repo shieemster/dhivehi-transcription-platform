@@ -9,6 +9,7 @@ export interface AuthUser {
   email: string;
   display_name: string;
   role: string;
+  mfa_enabled?: boolean;
 }
 
 interface LoginResult {

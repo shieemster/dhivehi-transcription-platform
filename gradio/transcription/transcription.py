@@ -6,6 +6,7 @@ import requests
 import redis
 import torch
 import urllib3
+import google.generativeai as genai
 from datetime import datetime
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 import librosa
@@ -52,6 +53,44 @@ minio_client = Minio(
     secure=True,
     http_client=_minio_http_client,
 )
+
+# Real embeddings for semantic search — replaces the 512-dim zero-vector
+# placeholder every segment used to be stored with (Qdrant was configured
+# with real vector search in mind but nothing ever populated real vectors).
+# EMBEDDING_DIM must match the Qdrant collection's existing vector size
+# (512, fixed at collection-creation time) — Gemini's gemini-embedding-001
+# supports an explicit output_dimensionality to truncate to exactly that,
+# via Matryoshka representation learning, so no collection migration is
+# needed. If no key is configured (or a call fails), embeddings fall back
+# to a zero vector rather than breaking transcription itself.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+EMBEDDING_DIM = 512
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("⚠️ GEMINI_API_KEY not set — segments will be stored with a zero vector; semantic search won't find anything")
+
+
+def generate_embedding(text: str):
+    """Returns (vector, generated). generated=False means the zero-vector
+    fallback was used (no key configured, empty text, or the API call
+    failed) — callers should keep embedding_generated=False in that case
+    so it's visible which segments actually got a real embedding."""
+    if not GEMINI_API_KEY or not text or not text.strip():
+        return [0.0] * EMBEDDING_DIM, False
+    try:
+        result = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=text,
+            task_type="retrieval_document",
+            output_dimensionality=EMBEDDING_DIM,
+        )
+        return result["embedding"], True
+    except Exception as e:
+        print(f"⚠️ Embedding generation failed, falling back to zero vector: {e}")
+        return [0.0] * EMBEDDING_DIM, False
 
 # SSE-C key — same 32-byte AES-256 key (base64-encoded in the env) that the
 # Go backend uses.
@@ -218,21 +257,28 @@ def update_segment_in_qdrant(segment_id, transcription):
         point_data = check_resp.json()
         existing_payload = point_data.get("result", {}).get("payload", {})
         existing_vector = point_data.get("result", {}).get("vector", [0.0] * 512)
-        
+
         print(f"🔍 Existing payload keys: {list(existing_payload.keys())}")
-        
+
+        # Now that we have real transcript text, compute a real embedding —
+        # the zero vector set at diarization time was only ever a
+        # placeholder (there was no text yet to embed at that point).
+        embedding, embedding_generated = generate_embedding(transcription)
+        vector = embedding if embedding_generated else existing_vector
+
         # Merge with new transcription data
         updated_payload = {**existing_payload}
         updated_payload["transcript_text"] = transcription
         updated_payload["status"] = "transcribed"
         updated_payload["transcription_completed_at"] = datetime.now().isoformat()
-        
+        updated_payload["embedding_generated"] = embedding_generated
+
         # Use upsert endpoint to update the entire point
         url = f"{QDRANT_HOST}/collections/{QDRANT_COLLECTION}/points?wait=true"
         payload = {
             "points": [{
                 "id": numeric_id,
-                "vector": existing_vector,
+                "vector": vector,
                 "payload": updated_payload
             }]
         }

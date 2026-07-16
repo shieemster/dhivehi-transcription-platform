@@ -2,14 +2,30 @@
 	auto_https off
 }
 
+# Shared browser-facing security headers. No custom Content-Security-Policy
+# here — Next.js dev mode (Turbopack HMR, inline styles) makes a strict CSP
+# easy to break without careful per-directive tuning, so it's left out
+# rather than shipping a CSP wide enough to be meaningless.
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+	}
+}
+
 :8000 {
 	tls /certs/public.crt /certs/private.key
+	import security_headers
 
 	reverse_proxy backend:8000
 }
 
 :3443 {
 	tls /certs/public.crt /certs/private.key
+	import security_headers
 
 	reverse_proxy frontend:3000
 }

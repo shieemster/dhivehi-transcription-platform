@@ -129,6 +129,7 @@ services:
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
       SSE_C_KEY: "${SSE_C_KEY}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY}"
       DAGSTER_ENABLED: "true"
       DAGSTER_API_URL: "http://dagster:3000"
     volumes:
@@ -162,6 +163,7 @@ services:
       DATABASE_URL: "postgres://transcript_app:${POSTGRES_PASSWORD:-changeme_dev_only}@postgres:5432/transcript_security?sslmode=disable"
       JWT_SECRET: "${JWT_SECRET:-dev_only_insecure_secret_change_me}"
       FRONTEND_ORIGIN: "${FRONTEND_ORIGIN:-https://localhost:3443}"
+      GIN_MODE: "release"
     volumes:
       - ./minio-certs/public.crt:/app/certs/public.crt:ro
     depends_on:

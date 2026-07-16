@@ -83,6 +83,18 @@ func ParseJWT(ctx context.Context, tokenString string) (*Claims, error) {
 		return nil, ErrTokenRevoked
 	}
 
+	// Session-epoch check: catches every OTHER session for this account at
+	// once (password change, "log out everywhere"), which the single-token
+	// Redis blocklist above can't do since it only knows about tokens it
+	// was explicitly handed.
+	validAfter, err := GetSessionsValidAfter(ctx, claims.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check session epoch: %w", err)
+	}
+	if claims.IssuedAt != nil && claims.IssuedAt.Time.Before(validAfter) {
+		return nil, ErrTokenRevoked
+	}
+
 	return claims, nil
 }
 

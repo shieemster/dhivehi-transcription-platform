@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -112,6 +113,7 @@ func Login(c *gin.Context) {
 			"email":        user.Email,
 			"display_name": user.DisplayName,
 			"role":         user.RoleName,
+			"mfa_enabled":  user.MFAEnabled,
 		},
 	})
 }
@@ -183,4 +185,61 @@ func MFAEnrollConfirm(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "MFA enabled"})
+}
+
+type changePasswordRequest struct {
+	CurrentPassword string `json:"current_password" binding:"required"`
+	NewPassword     string `json:"new_password" binding:"required"`
+}
+
+// ChangePassword handles POST /auth/change-password. On success, every
+// session for this account is invalidated — including the one making this
+// request — since a compromised token is exactly the scenario a password
+// change is meant to recover from. The client should treat a successful
+// response like a forced logout and redirect to the login page.
+func ChangePassword(c *gin.Context) {
+	claims := c.MustGet("claims").(*services.Claims)
+
+	var req changePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "current_password and new_password are required"})
+		return
+	}
+
+	if err := services.ChangePassword(c.Request.Context(), claims.UserID, req.CurrentPassword, req.NewPassword); err != nil {
+		switch {
+		case errors.Is(err, services.ErrInvalidCredentials):
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "current password is incorrect"})
+		case errors.Is(err, services.ErrWeakPassword):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			log.Printf("⚠️ change password error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to change password"})
+		}
+		return
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "password_changed", "user", claims.UserID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "password changed — please log in again"})
+}
+
+// LogoutAllSessions handles POST /auth/logout-all — a self-service "log out
+// everywhere" for when a device is lost or a token is suspected leaked,
+// invalidating every session for the account rather than just the current one.
+func LogoutAllSessions(c *gin.Context) {
+	claims := c.MustGet("claims").(*services.Claims)
+
+	if err := services.InvalidateAllSessions(c.Request.Context(), claims.UserID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to log out all sessions"})
+		return
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "logout_all_sessions", "user", claims.UserID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "logged out of all sessions"})
 }

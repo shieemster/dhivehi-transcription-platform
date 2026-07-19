@@ -13,14 +13,27 @@ import (
 var ErrInvalidToken = errors.New("invalid or expired token")
 var ErrTokenRevoked = errors.New("token has been revoked")
 
+// SessionCookieName is the httpOnly cookie the session JWT travels in.
+// Cookies are scoped by host, not port, so this one cookie is valid for
+// both the API (:8000) and frontend (:3443) since they're both on
+// "localhost" behind Caddy.
+const SessionCookieName = "transcript_session"
+
 // Claims carried inside the JWT. RoleName is embedded directly so the RBAC
 // middleware (step 3) can check permissions without a DB round trip on
 // every request — GetUserPermissions is still the source of truth and gets
 // re-checked on login/refresh, not trusted blindly forever.
+//
+// MFAPending marks a deliberately restricted token: issued when a role that
+// requires MFA (administrator/supervisor) logs in correctly but hasn't
+// enrolled yet. It carries just enough trust to call the MFA enrollment
+// endpoints and nothing else — see middleware.RequireFullSession, which
+// every other route (including plain logout) is gated behind.
 type Claims struct {
-	UserID   string `json:"user_id"`
-	Email    string `json:"email"`
-	RoleName string `json:"role_name"`
+	UserID     string `json:"user_id"`
+	Email      string `json:"email"`
+	RoleName   string `json:"role_name"`
+	MFAPending bool   `json:"mfa_pending,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -32,8 +45,25 @@ func jwtSecret() ([]byte, error) {
 	return []byte(secret), nil
 }
 
-// IssueJWT creates a signed token valid for the given duration.
+// IssueJWT creates a signed, full-access token valid for the given duration.
 func IssueJWT(userID, email, roleName string, ttl time.Duration) (string, error) {
+	return issueJWT(userID, email, roleName, ttl, false)
+}
+
+// MFAEnrollmentTokenTTL is deliberately short — this token only exists to
+// bridge "password verified" to "MFA enrolled," not to be a normal session.
+const MFAEnrollmentTokenTTL = 15 * time.Minute
+
+// IssueMFAEnrollmentToken creates a restricted token for a user whose role
+// requires MFA but hasn't enrolled yet. It authenticates them (so the
+// enrollment endpoints know who they are) without granting access to
+// anything else — middleware.RequireFullSession rejects it everywhere
+// except MFA enrollment.
+func IssueMFAEnrollmentToken(userID, email, roleName string) (string, error) {
+	return issueJWT(userID, email, roleName, MFAEnrollmentTokenTTL, true)
+}
+
+func issueJWT(userID, email, roleName string, ttl time.Duration, mfaPending bool) (string, error) {
 	secret, err := jwtSecret()
 	if err != nil {
 		return "", err
@@ -41,9 +71,10 @@ func IssueJWT(userID, email, roleName string, ttl time.Duration) (string, error)
 
 	now := time.Now()
 	claims := Claims{
-		UserID:   userID,
-		Email:    email,
-		RoleName: roleName,
+		UserID:     userID,
+		Email:      email,
+		RoleName:   roleName,
+		MFAPending: mfaPending,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),

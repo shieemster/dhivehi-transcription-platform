@@ -42,10 +42,14 @@ func main() {
 		log.Fatalf("❌ Failed to set trusted proxies: %v", err)
 	}
 
-	// Enable CORS for frontend
+	// Enable CORS for frontend. Allow-Credentials is required for the
+	// browser to send/accept the httpOnly session cookie cross-port — it
+	// only takes effect together with a non-wildcard Allow-Origin, which is
+	// already the case here.
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", frontendOrigin)
 		c.Writer.Header().Set("Vary", "Origin")
+		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, PATCH, DELETE, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
 		if c.Request.Method == "OPTIONS" {
@@ -56,8 +60,12 @@ func main() {
 	})
 
 	// --- Data routes — now require a valid session AND the matching permission ---
+	// RequireFullSession additionally blocks a restricted MFA-enrollment
+	// token (see services.IssueMFAEnrollmentToken) from every route here —
+	// an administrator/supervisor who hasn't enrolled MFA yet can't touch
+	// any actual data until they do.
 	protected := r.Group("/")
-	protected.Use(middleware.RequireAuth())
+	protected.Use(middleware.RequireAuth(), middleware.RequireFullSession())
 	{
 		protected.POST("/upload",
 			middleware.RequirePermission("transcript:upload"),
@@ -122,6 +130,26 @@ func main() {
 		protected.GET("/security/dashboard",
 			middleware.RequirePermission("security_dashboard:view"),
 			handlers.GetSecurityDashboard)
+
+		protected.GET("/system/health",
+			middleware.RequirePermission("security_dashboard:view"),
+			handlers.GetSystemHealth)
+
+		protected.GET("/users",
+			middleware.RequirePermission("user:manage"),
+			handlers.ListUsers)
+
+		protected.POST("/users",
+			middleware.RequirePermission("user:manage"),
+			handlers.CreateUserHandler)
+
+		protected.PATCH("/users/:user_id",
+			middleware.RequirePermission("user:manage"),
+			handlers.UpdateUserHandler)
+
+		protected.DELETE("/users/:user_id",
+			middleware.RequirePermission("user:manage"),
+			handlers.DeactivateUserHandler)
 	}
 
 	// --- Auth routes ---
@@ -130,11 +158,17 @@ func main() {
 	authorized := r.Group("/auth")
 	authorized.Use(middleware.RequireAuth())
 	{
+		// Always reachable, even on a restricted MFA-enrollment token — a
+		// user mid-mandatory-enrollment must still be able to back out, and
+		// enrolling is the entire point of that token.
 		authorized.POST("/logout", handlers.Logout)
-		authorized.POST("/logout-all", handlers.LogoutAllSessions)
-		authorized.POST("/change-password", handlers.ChangePassword)
+		authorized.GET("/me", handlers.Me)
 		authorized.POST("/mfa/enroll/start", handlers.MFAEnrollStart)
 		authorized.POST("/mfa/enroll/confirm", handlers.MFAEnrollConfirm)
+
+		// Everything else needs a real, fully-authenticated session.
+		authorized.POST("/logout-all", middleware.RequireFullSession(), handlers.LogoutAllSessions)
+		authorized.POST("/change-password", middleware.RequireFullSession(), handlers.ChangePassword)
 	}
 
 	log.Println("🚀 Backend server starting on :8000")

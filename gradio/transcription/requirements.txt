@@ -4,7 +4,7 @@ torchaudio==2.6.0
 librosa==0.10.1
 soundfile==0.12.1
 redis==5.0.1
-requests==2.31.0
+requests==2.34.2
 numpy==1.26.4
 accelerate
 sentencepiece

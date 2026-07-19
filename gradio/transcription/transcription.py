@@ -5,6 +5,7 @@ import base64
 import requests
 import redis
 import torch
+import threading
 import urllib3
 import google.generativeai as genai
 from datetime import datetime
@@ -385,6 +386,21 @@ def check_all_segments_transcribed(file_id):
         return False
 
 # =========================
+# Health heartbeat
+# =========================
+
+WORKER_NAME = "transcription"
+
+def _heartbeat_loop():
+    # Independent daemon thread — see the matching comment in convert.py.
+    while True:
+        try:
+            r.set(f"worker_heartbeat:{WORKER_NAME}", str(int(time.time())), ex=30)
+        except Exception:
+            pass
+        time.sleep(10)
+
+# =========================
 # Worker Loop
 # =========================
 
@@ -471,4 +487,5 @@ def worker_loop():
             time.sleep(5)
 
 if __name__ == "__main__":
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
     worker_loop()

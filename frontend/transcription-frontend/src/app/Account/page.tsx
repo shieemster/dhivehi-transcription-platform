@@ -1,7 +1,8 @@
 'use client'
+import { Suspense } from 'react'
 import * as React from "react";
 const { useState, useEffect } = React;
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import QRCode from "qrcode";
 import { Card, CardHeader, CardContent, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -17,6 +18,7 @@ import {
   KeyRound,
   ShieldCheck,
   ShieldOff,
+  ShieldAlert,
   LogOutIcon,
   Loader2,
   Check,
@@ -51,14 +53,24 @@ export function ThemeToggle() {
 }
 
 export default function AccountPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-stone-200 dark:bg-neutral-900 animate-pulse" />}>
+      <AccountPageInner />
+    </Suspense>
+  );
+}
+
+function AccountPageInner() {
   const router = useRouter();
-  const { user, token, authFetch, logout, isLoading: authLoading } = useAuth();
+  const searchParams = useSearchParams();
+  const mandatoryMfa = searchParams.get('mandatoryMfa') === '1';
+  const { user, isAuthenticated, authFetch, logout, completeMfaEnrollment, isLoading: authLoading } = useAuth();
 
   useEffect(() => {
-    if (!authLoading && !token) {
+    if (!authLoading && !isAuthenticated) {
       router.push("/login");
     }
-  }, [authLoading, token, router]);
+  }, [authLoading, isAuthenticated, router]);
 
   // --- Change password ---
   const [currentPassword, setCurrentPassword] = useState("");
@@ -117,6 +129,16 @@ export default function AccountPage() {
     setMfaEnabled(user?.mfa_enabled ?? false);
   }, [user]);
 
+  // Mandatory enrollment (administrator/supervisor without MFA yet) —
+  // jump straight into the QR code instead of making them click "Enable
+  // MFA" first, since there's no path forward except enrolling.
+  useEffect(() => {
+    if (mandatoryMfa && !mfaEnabled && !enrolling && !mfaConfirmed) {
+      startMfaEnrollment();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mandatoryMfa, mfaEnabled]);
+
   async function startMfaEnrollment() {
     setMfaError(null);
     try {
@@ -158,6 +180,16 @@ export default function AccountPage() {
       setQrDataUrl(null);
       setMfaSecret(null);
       setMfaCode("");
+
+      // The backend always sets a fresh full-access session cookie on this
+      // response — this matters most for mandatory enrollment, where the
+      // cookie used to get this far was a restricted one that can't reach
+      // anything else.
+      completeMfaEnrollment();
+
+      if (mandatoryMfa) {
+        setTimeout(() => router.push("/"), 1500);
+      }
     } catch (err) {
       setMfaError(err instanceof Error ? err.message : "Invalid code — check your authenticator app and try again");
     } finally {
@@ -188,7 +220,7 @@ export default function AccountPage() {
     }
   }
 
-  if (authLoading || !token) {
+  if (authLoading || !isAuthenticated) {
     return (
       <div className="min-h-screen bg-stone-200 dark:bg-neutral-900 flex items-center justify-center">
         <Loader2 className="w-10 h-10 animate-spin text-stone-600 dark:text-neutral-400" />
@@ -196,13 +228,20 @@ export default function AccountPage() {
     );
   }
 
+  // While true, the session is a restricted MFA-enrollment token (see
+  // backend middleware.RequireFullSession) — change-password and
+  // logout-all would just fail with a 403, and there's nowhere else in the
+  // app this token can go, so those sections and navigation are hidden
+  // until enrollment completes.
+  const restrictedSession = mandatoryMfa && !mfaEnabled;
+
   return (
     <div className="min-h-screen bg-stone-200 dark:bg-neutral-900 transition-all duration-500 ease-in-out">
       <header className="backdrop-blur-sm shadow-md dark:shadow-lg">
         <div className="max-w-8xl mx-auto pl-2 pr-6 py-4 flex items-center justify-between gap-2">
           <h1
-            className="text-2xl font-bold text-neutral-700 dark:text-white cursor-pointer hover:text-neutral-900 dark:hover:text-neutral-200"
-            onClick={() => router.push("/")}
+            className={`text-2xl font-bold text-neutral-700 dark:text-white ${restrictedSession ? '' : 'cursor-pointer hover:text-neutral-900 dark:hover:text-neutral-200'}`}
+            onClick={() => !restrictedSession && router.push("/")}
           >
             Account Settings
           </h1>
@@ -211,14 +250,24 @@ export default function AccountPage() {
       </header>
 
       <main className="max-w-2xl mx-auto px-6 py-6 space-y-6">
-        <Button
-          onClick={() => router.push("/")}
-          variant="ghost"
-          className="text-stone-700 dark:text-neutral-300 hover:text-stone-900 dark:hover:text-white"
-        >
-          <ArrowLeft className="w-4 h-4 mr-2" />
-          Back to Home
-        </Button>
+        {restrictedSession ? (
+          <Card className="shadow-lg bg-amber-50 dark:bg-amber-900/20 border-amber-300 dark:border-amber-700">
+            <CardContent className="p-4 flex items-center gap-3 text-sm text-amber-800 dark:text-amber-200">
+              <ShieldAlert className="w-5 h-5 shrink-0" />
+              Your role requires two-factor authentication. Finish enrolling below to continue — nothing else in
+              the app is accessible until then.
+            </CardContent>
+          </Card>
+        ) : (
+          <Button
+            onClick={() => router.push("/")}
+            variant="ghost"
+            className="text-stone-700 dark:text-neutral-300 hover:text-stone-900 dark:hover:text-white"
+          >
+            <ArrowLeft className="w-4 h-4 mr-2" />
+            Back to Home
+          </Button>
+        )}
 
         {user && (
           <Card className="shadow-lg bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700">
@@ -229,7 +278,9 @@ export default function AccountPage() {
           </Card>
         )}
 
-        {/* Change password */}
+        {/* Change password — hidden during mandatory enrollment, since a
+            restricted token can't reach this endpoint anyway */}
+        {!restrictedSession && (
         <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700">
           <CardHeader>
             <CardTitle className="text-lg text-neutral-900 dark:text-white flex items-center gap-2">
@@ -293,6 +344,7 @@ export default function AccountPage() {
             )}
           </CardContent>
         </Card>
+        )}
 
         {/* MFA */}
         <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700">
@@ -384,7 +436,9 @@ export default function AccountPage() {
           </CardContent>
         </Card>
 
-        {/* Sessions */}
+        {/* Sessions — hidden during mandatory enrollment, same reason as
+            Change Password above */}
+        {!restrictedSession && (
         <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700">
           <CardHeader>
             <CardTitle className="text-lg text-neutral-900 dark:text-white flex items-center gap-2">
@@ -408,6 +462,7 @@ export default function AccountPage() {
             </Button>
           </CardContent>
         </Card>
+        )}
       </main>
     </div>
   );

@@ -1,5 +1,8 @@
-# Use Go 1.24
-FROM golang:1.24-bullseye
+# Use Go 1.25 — go.mod requires this (pulled in transitively by the pgx
+# v5.9.2 security upgrade, see govulncheck GO-2026-5004). No bullseye
+# variant is published for 1.25 (Debian bullseye is being phased out of
+# the official image), so this also moves to bookworm.
+FROM golang:1.25-bookworm
 
 # Set working directory inside container
 WORKDIR /app

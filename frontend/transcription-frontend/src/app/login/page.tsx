@@ -35,6 +35,13 @@ export default function LoginPage() {
       setMfaRequired(true);
       return;
     }
+    if (result.mfaEnrollmentRequired) {
+      // This role requires MFA and the account hasn't enrolled yet — the
+      // restricted token from login only works against the enroll
+      // endpoints, so send them straight there instead of home.
+      router.push("/Account?mandatoryMfa=1");
+      return;
+    }
     setError(result.error ?? "Login failed");
   }
 

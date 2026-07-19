@@ -117,13 +117,13 @@ function TranscriptDetailsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const jobId = searchParams.get('job_id');
-  const { authFetch, token, isLoading: authLoading } = useAuth();
+  const { authFetch, isAuthenticated, isLoading: authLoading } = useAuth();
 
   useEffect(() => {
-    if (!authLoading && !token) {
+    if (!authLoading && !isAuthenticated) {
       router.push("/login");
     }
-  }, [authLoading, token, router]);
+  }, [authLoading, isAuthenticated, router]);
 
   const [mounted, setMounted] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -175,17 +175,17 @@ function TranscriptDetailsPage() {
       setLoading(false);
       return;
     }
-    if (token) {
+    if (isAuthenticated) {
       fetchTranscriptData();
     }
-  }, [jobId, token, authLoading]);
+  }, [jobId, isAuthenticated, authLoading]);
 
   useEffect(() => {
-    if (!token || !jobId) return;
+    if (!isAuthenticated || !jobId) return;
     apiFetch<RelatedTranscript[]>(authFetch, `${BACKEND_URL}/transcripts/${jobId}/related`)
       .then(data => setRelatedTranscripts(data ?? []))
       .catch(() => setRelatedTranscripts([])); // non-critical — just don't show the section
-  }, [token, jobId, authFetch]);
+  }, [isAuthenticated, jobId, authFetch]);
 
   // Poll quietly while the pipeline hasn't finished, so convert -> diarize
   // -> transcribe progress shows up without a manual reload. "transcribed"
@@ -193,14 +193,14 @@ function TranscriptDetailsPage() {
   // (see gradio/transcription/transcription.py) — anything else is worth
   // continuing to check.
   useEffect(() => {
-    if (!token || !jobId || !parent) return;
+    if (!isAuthenticated || !jobId || !parent) return;
     if (parent.status === 'transcribed' || parent.status === 'error') return;
 
     const interval = setInterval(() => {
       fetchTranscriptData({ background: true });
     }, 5000);
     return () => clearInterval(interval);
-  }, [token, jobId, parent?.status]);
+  }, [isAuthenticated, jobId, parent?.status]);
 
   useEffect(() => {
     return () => {

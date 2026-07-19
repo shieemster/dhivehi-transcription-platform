@@ -16,6 +16,7 @@ var ErrUserNotFound = errors.New("user not found")
 var ErrEmailTaken = errors.New("email already registered")
 var ErrInvalidCredentials = errors.New("invalid email or password")
 var ErrWeakPassword = errors.New("password must be at least 8 characters")
+var ErrInvalidRole = errors.New("invalid role")
 
 const minPasswordLength = 8
 
@@ -55,10 +56,105 @@ func CreateUser(ctx context.Context, email, displayName, plainPassword, roleName
 		if isUniqueViolation(err) {
 			return nil, ErrEmailTaken
 		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The INSERT...SELECT matched zero role rows, so RETURNING has
+			// nothing to scan — this is what an unrecognized roleName looks
+			// like, not a real DB failure.
+			return nil, ErrInvalidRole
+		}
 		return nil, fmt.Errorf("failed to create user: %w", err)
 	}
 	u.RoleName = roleName
 	return &u, nil
+}
+
+// GetUserByID returns the safe (non-secret) fields for a single user by ID
+// — used by the admin user-management screen, which never needs the
+// password hash or MFA secret.
+func GetUserByID(ctx context.Context, userID string) (*models.User, error) {
+	row := DB.QueryRow(ctx, `
+		SELECT u.id, u.email, u.display_name, u.role_id, r.name, u.mfa_enabled, u.is_active, u.created_at
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		WHERE u.id = $1
+	`, userID)
+
+	var u models.User
+	if err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.RoleName, &u.MFAEnabled, &u.IsActive, &u.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("failed to fetch user: %w", err)
+	}
+	return &u, nil
+}
+
+// ListUsers returns every account (active and deactivated) for the admin
+// user-management screen, oldest first.
+func ListUsers(ctx context.Context) ([]models.User, error) {
+	rows, err := DB.Query(ctx, `
+		SELECT u.id, u.email, u.display_name, u.role_id, r.name, u.mfa_enabled, u.is_active, u.created_at
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		ORDER BY u.created_at
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list users: %w", err)
+	}
+	defer rows.Close()
+
+	users := []models.User{}
+	for rows.Next() {
+		var u models.User
+		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.RoleName, &u.MFAEnabled, &u.IsActive, &u.CreatedAt); err != nil {
+			return nil, fmt.Errorf("failed to scan user: %w", err)
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
+// UpdateUser applies a partial update — any nil field is left unchanged.
+// Changing the role or deactivating the account immediately invalidates
+// every session for that user (same InvalidateAllSessions used by
+// ChangePassword), so the change takes effect right away rather than
+// waiting for the JWT — which already embeds the old role/active state —
+// to expire on its own.
+func UpdateUser(ctx context.Context, userID string, displayName *string, roleName *string, isActive *bool) (*models.User, error) {
+	var roleID *int16
+	if roleName != nil {
+		var rid int16
+		if err := DB.QueryRow(ctx, `SELECT id FROM roles WHERE name = $1`, *roleName).Scan(&rid); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrInvalidRole
+			}
+			return nil, fmt.Errorf("failed to resolve role: %w", err)
+		}
+		roleID = &rid
+	}
+
+	tag, err := DB.Exec(ctx, `
+		UPDATE users SET
+			display_name = COALESCE($1, display_name),
+			role_id      = COALESCE($2, role_id),
+			is_active    = COALESCE($3, is_active),
+			updated_at   = now()
+		WHERE id = $4
+	`, displayName, roleID, isActive, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update user: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrUserNotFound
+	}
+
+	if roleName != nil || (isActive != nil && !*isActive) {
+		if err := InvalidateAllSessions(ctx, userID); err != nil {
+			return nil, fmt.Errorf("updated user but failed to invalidate sessions: %w", err)
+		}
+	}
+
+	return GetUserByID(ctx, userID)
 }
 
 // GetUserByEmail returns the full user record including password_hash —

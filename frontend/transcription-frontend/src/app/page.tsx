@@ -4,24 +4,58 @@ const { useState, useEffect } = React;
 import { useRouter } from "next/navigation";
 import { Card, CardHeader, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Upload, List, Moon, Sun, Loader2, LogOut, ShieldCheck, UserCog } from "lucide-react";
+import { Upload, List, Moon, Sun, Loader2, LogOut, ShieldCheck, UserCog, Users, Activity } from "lucide-react";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
 import { useTheme } from "next-themes";
 
+// Reads the resolved theme only for the toggle button's own icon/label —
+// guarded by `mounted` (like every other page's ThemeToggle) so it doesn't
+// render the wrong icon before hydration. Everything else on this page uses
+// Tailwind's `dark:` variant classes instead of JS-computed colors, which is
+// what avoids a light-mode flash: next-themes stamps the `dark` class onto
+// <html> before hydration, so `dark:` classes are correct on the very first
+// paint with no JS involved. Colors that depend on `themeMounted` gate the
+// WHOLE page behind a post-mount flag, which is what caused the flash.
+function ThemeToggleButton() {
+  const { theme, setTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+
+  if (!mounted) {
+    return (
+      <Button variant="ghost" size="icon" disabled className="transition-all duration-300 ease-in-out">
+        <Moon className="h-5 w-5 text-stone-700" />
+      </Button>
+    );
+  }
+
+  return (
+    <Button
+      variant="ghost"
+      size="icon"
+      onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+      className="transition-all duration-300 ease-in-out hover:scale-110"
+    >
+      {theme === "dark" ? (
+        <Sun className="h-5 w-5 text-neutral-400" />
+      ) : (
+        <Moon className="h-5 w-5 text-stone-700" />
+      )}
+    </Button>
+  );
+}
+
 // Main Component
 export default function TranscriptionApp() {
   const router = useRouter();
-  const { user, token, isLoading: authLoading, logout, authFetch } = useAuth();
-  const { setTheme, resolvedTheme } = useTheme();
-  const [themeMounted, setThemeMounted] = useState(false);
-  useEffect(() => setThemeMounted(true), []);
+  const { user, isAuthenticated, isLoading: authLoading, logout, authFetch } = useAuth();
 
   useEffect(() => {
-    if (!authLoading && !token) {
+    if (!authLoading && !isAuthenticated) {
       router.push("/login");
     }
-  }, [authLoading, token, router]);
+  }, [authLoading, isAuthenticated, router]);
 
   async function handleLogout() {
     await logout();
@@ -39,7 +73,7 @@ export default function TranscriptionApp() {
   // meaning stats (and the underlying data) were reachable by anyone who
   // could reach the Qdrant port, entirely bypassing RBAC.
   useEffect(() => {
-    if (!token) return; // wait for session to be restored before fetching
+    if (!isAuthenticated) return; // wait for session to be restored before fetching
 
     const fetchStats = async () => {
       try {
@@ -72,7 +106,7 @@ export default function TranscriptionApp() {
     // Refresh stats every 30 seconds
     const interval = setInterval(fetchStats, 30000);
     return () => clearInterval(interval);
-  }, [token, authFetch]);
+  }, [isAuthenticated, authFetch]);
 
   const handleNavigateToList = () => {
     window.location.href = "/Transcripts/List";
@@ -82,25 +116,17 @@ export default function TranscriptionApp() {
     window.location.href = "/Transcripts";
   };
 
-  // themeMounted guards against a server/client mismatch — next-themes
-  // can't know the persisted theme until after hydration, same as every
-  // other page's ThemeToggle. Before that, default to light rather than
-  // flashing dark then correcting.
-  const isDark = themeMounted && resolvedTheme === 'dark';
-
   return (
-    <div className={`min-h-screen transition-colors duration-300 ease-in-out ${isDark ? 'bg-neutral-900' : 'bg-stone-200'
-      }`}>
+    <div className="min-h-screen bg-stone-200 dark:bg-neutral-900 transition-colors duration-300 ease-in-out">
       {/* Header */}
       <header className="backdrop-blur-sm shadow-md dark:shadow-lg transition-all duration-300 ease-in-out">
         <div className="max-w-8xl mx-auto pl-2 pr-6 py-4 flex items-center justify-between gap-2">
-          <h1 className={`text-2xl font-bold transition-colors duration-300 ease-in-out ${isDark ? 'text-white' : 'text-neutral-700'
-            }`}>
+          <h1 className="text-2xl font-bold text-neutral-700 dark:text-white transition-colors duration-300 ease-in-out">
             Transcription App
           </h1>
           <div className="flex items-center gap-3">
             {user && (
-              <span className={`text-sm hidden sm:inline ${isDark ? 'text-neutral-300' : 'text-neutral-600'}`}>
+              <span className="text-sm hidden sm:inline text-neutral-600 dark:text-neutral-300">
                 {user.display_name} · <span className="capitalize">{user.role}</span>
               </span>
             )}
@@ -112,7 +138,29 @@ export default function TranscriptionApp() {
                 title="Security Dashboard"
                 className="transition-all duration-300 ease-in-out hover:scale-110"
               >
-                <ShieldCheck className={`h-5 w-5 ${isDark ? 'text-neutral-300' : 'text-neutral-700'}`} />
+                <ShieldCheck className="h-5 w-5 text-neutral-700 dark:text-neutral-300" />
+              </Button>
+            )}
+            {user?.role === 'administrator' && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => (window.location.href = "/Admin/Users")}
+                title="User Management"
+                className="transition-all duration-300 ease-in-out hover:scale-110"
+              >
+                <Users className="h-5 w-5 text-neutral-700 dark:text-neutral-300" />
+              </Button>
+            )}
+            {user?.role === 'administrator' && (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => (window.location.href = "/Admin/Health")}
+                title="System Health"
+                className="transition-all duration-300 ease-in-out hover:scale-110"
+              >
+                <Activity className="h-5 w-5 text-neutral-700 dark:text-neutral-300" />
               </Button>
             )}
             {user && (
@@ -123,21 +171,10 @@ export default function TranscriptionApp() {
                 title="Account Settings"
                 className="transition-all duration-300 ease-in-out hover:scale-110"
               >
-                <UserCog className={`h-5 w-5 ${isDark ? 'text-neutral-300' : 'text-neutral-700'}`} />
+                <UserCog className="h-5 w-5 text-neutral-700 dark:text-neutral-300" />
               </Button>
             )}
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => setTheme(isDark ? "light" : "dark")}
-              className="transition-all duration-300 ease-in-out hover:scale-110"
-            >
-              {isDark ? (
-                <Sun className="h-5 w-5 transition-all duration-300 ease-in-out text-neutral-400" />
-              ) : (
-                <Moon className="h-5 w-5 transition-all duration-300 ease-in-out text-stone-700" />
-              )}
-            </Button>
+            <ThemeToggleButton />
             {user && (
               <Button
                 variant="ghost"
@@ -146,7 +183,7 @@ export default function TranscriptionApp() {
                 title="Log out"
                 className="transition-all duration-300 ease-in-out hover:scale-110"
               >
-                <LogOut className={`h-5 w-5 ${isDark ? 'text-neutral-300' : 'text-neutral-700'}`} />
+                <LogOut className="h-5 w-5 text-neutral-700 dark:text-neutral-300" />
               </Button>
             )}
           </div>
@@ -156,12 +193,10 @@ export default function TranscriptionApp() {
       {/* Main Content */}
       <main className="max-w-4xl mx-auto px-6 py-6 transition-all duration-300 ease-in-out">
         <div className="text-center mb-12 transition-all duration-300 ease-in-out">
-          <h2 className={`text-5xl font-bold mb-4 transition-colors duration-300 ease-in-out ${isDark ? 'text-white' : 'text-neutral-700'
-            }`}>
+          <h2 className="text-5xl font-bold mb-4 text-neutral-700 dark:text-white transition-colors duration-300 ease-in-out">
             Welcome to Transcription App
           </h2>
-          <p className={`text-xl transition-colors duration-300 ease-in-out ${isDark ? 'text-neutral-300' : 'text-stone-600'
-            }`}>
+          <p className="text-xl text-stone-600 dark:text-neutral-300 transition-colors duration-300 ease-in-out">
             <span className="font-bold">Generate</span>,{" "}
             <span className="font-bold">Store</span> and{" "}
             <span className="font-bold">Manage</span> your{" "}
@@ -171,8 +206,7 @@ export default function TranscriptionApp() {
 
         {/* Error Message */}
         {error && (
-          <div className={`mb-6 p-4 rounded-lg ${isDark ? 'bg-red-900 text-red-200' : 'bg-red-100 text-red-800'
-            }`}>
+          <div className="mb-6 p-4 rounded-lg bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">
             <p className="font-semibold">Error loading stats:</p>
             <p className="text-sm">{error}</p>
             <Button
@@ -189,25 +223,19 @@ export default function TranscriptionApp() {
         {/* Stats Cards */}
         <div className="grid md:grid-cols-3 gap-6 transition-all duration-300 ease-in-out">
           <Card
-            className={`shadow-lg border transition-all duration-300 ease-in-out hover:scale-105 cursor-pointer ${isDark
-              ? 'bg-neutral-800 border-neutral-700'
-              : 'bg-stone-100 border-stone-200'
-              }`}
+            className="shadow-lg border bg-stone-100 border-stone-200 dark:bg-neutral-800 dark:border-neutral-700 transition-all duration-300 ease-in-out hover:scale-105 cursor-pointer"
             onClick={handleNavigateToList}
           >
             <CardHeader>
-              <h3 className={`text-lg font-semibold ${isDark ? 'text-white' : 'text-stone-900'
-                }`}>
+              <h3 className="text-lg font-semibold text-stone-900 dark:text-white">
                 Hours Transcribed
               </h3>
             </CardHeader>
             <CardContent>
               {loading ? (
-                <Loader2 className={`w-12 h-12 animate-spin ${isDark ? 'text-neutral-300' : 'text-stone-600'
-                  }`} />
+                <Loader2 className="w-12 h-12 animate-spin text-stone-600 dark:text-neutral-300" />
               ) : (
-                <p className={`text-5xl font-bold ${isDark ? 'text-neutral-300' : 'text-stone-600'
-                  }`}>
+                <p className="text-5xl font-bold text-stone-600 dark:text-neutral-300">
                   {hoursTranscribed.toFixed(1)}
                 </p>
               )}
@@ -215,25 +243,19 @@ export default function TranscriptionApp() {
           </Card>
 
           <Card
-            className={`shadow-lg border transition-all duration-300 ease-in-out hover:scale-105 cursor-pointer ${isDark
-              ? 'bg-neutral-800 border-neutral-700'
-              : 'bg-stone-100 border-stone-200'
-              }`}
+            className="shadow-lg border bg-stone-100 border-stone-200 dark:bg-neutral-800 dark:border-neutral-700 transition-all duration-300 ease-in-out hover:scale-105 cursor-pointer"
             onClick={handleNavigateToList}
           >
             <CardHeader>
-              <h3 className={`text-lg font-semibold ${isDark ? 'text-white' : 'text-stone-900'
-                }`}>
+              <h3 className="text-lg font-semibold text-stone-900 dark:text-white">
                 Pending Transcripts
               </h3>
             </CardHeader>
             <CardContent>
               {loading ? (
-                <Loader2 className={`w-12 h-12 animate-spin ${isDark ? 'text-neutral-300' : 'text-stone-600'
-                  }`} />
+                <Loader2 className="w-12 h-12 animate-spin text-stone-600 dark:text-neutral-300" />
               ) : (
-                <p className={`text-5xl font-bold ${isDark ? 'text-neutral-300' : 'text-stone-600'
-                  }`}>
+                <p className="text-5xl font-bold text-stone-600 dark:text-neutral-300">
                   {pendingTranscriptions}
                 </p>
               )}
@@ -241,25 +263,19 @@ export default function TranscriptionApp() {
           </Card>
 
           <Card
-            className={`shadow-lg border transition-all duration-300 ease-in-out hover:scale-105 cursor-pointer ${isDark
-              ? 'bg-neutral-800 border-neutral-700'
-              : 'bg-stone-100 border-stone-200'
-              }`}
+            className="shadow-lg border bg-stone-100 border-stone-200 dark:bg-neutral-800 dark:border-neutral-700 transition-all duration-300 ease-in-out hover:scale-105 cursor-pointer"
             onClick={handleNavigateToList}
           >
             <CardHeader>
-              <h3 className={`text-lg font-semibold ${isDark ? 'text-white' : 'text-stone-900'
-                }`}>
+              <h3 className="text-lg font-semibold text-stone-900 dark:text-white">
                 Completed Transcriptions
               </h3>
             </CardHeader>
             <CardContent>
               {loading ? (
-                <Loader2 className={`w-12 h-12 animate-spin ${isDark ? 'text-neutral-300' : 'text-stone-600'
-                  }`} />
+                <Loader2 className="w-12 h-12 animate-spin text-stone-600 dark:text-neutral-300" />
               ) : (
-                <p className={`text-5xl font-bold ${isDark ? 'text-neutral-300' : 'text-stone-600'
-                  }`}>
+                <p className="text-5xl font-bold text-stone-600 dark:text-neutral-300">
                   {completedTranscriptions}
                 </p>
               )}
@@ -272,10 +288,7 @@ export default function TranscriptionApp() {
           <div className="flex flex-col sm:flex-row gap-4 justify-center">
             <Button
               onClick={handleNavigateToUpload}
-              className={`text-white hover:scale-105 transition-all duration-300 ease-in-out ${isDark
-                ? 'bg-neutral-700 hover:bg-neutral-600'
-                : 'bg-stone-600 hover:bg-stone-700'
-                }`}
+              className="text-white bg-stone-600 hover:bg-stone-700 dark:bg-neutral-700 dark:hover:bg-neutral-600 hover:scale-105 transition-all duration-300 ease-in-out"
             >
               <Upload className="w-4 h-4 mr-2" />
               Upload File
@@ -284,10 +297,7 @@ export default function TranscriptionApp() {
             <Button
               onClick={handleNavigateToList}
               variant="outline"
-              className={`border hover:scale-105 transition-all duration-300 ease-in-out ${isDark
-                ? 'bg-neutral-800 hover:bg-neutral-700 border-neutral-600 text-neutral-200'
-                : 'bg-stone-100 hover:bg-stone-200 border-stone-300 text-stone-700'
-                }`}
+              className="border bg-stone-100 hover:bg-stone-200 border-stone-300 text-stone-700 dark:bg-neutral-800 dark:hover:bg-neutral-700 dark:border-neutral-600 dark:text-neutral-200 hover:scale-105 transition-all duration-300 ease-in-out"
             >
               <List className="w-4 h-4 mr-2" />
               View All Transcripts

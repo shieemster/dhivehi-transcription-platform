@@ -89,7 +89,7 @@ const AUTO_REFRESH_MS = 30000;
 
 export default function SecurityDashboard() {
   const router = useRouter();
-  const { user, token, authFetch, isLoading: authLoading } = useAuth();
+  const { user, isAuthenticated, authFetch, isLoading: authLoading } = useAuth();
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -100,7 +100,7 @@ export default function SecurityDashboard() {
 
   useEffect(() => {
     if (authLoading) return;
-    if (!token) {
+    if (!isAuthenticated) {
       router.push("/login");
       return;
     }
@@ -111,7 +111,7 @@ export default function SecurityDashboard() {
       router.push("/");
       return;
     }
-  }, [authLoading, token, user, router]);
+  }, [authLoading, isAuthenticated, user, router]);
 
   const loadDashboard = React.useCallback(async (opts: { background?: boolean } = {}) => {
     try {
@@ -141,13 +141,13 @@ export default function SecurityDashboard() {
   }, [authFetch, router]);
 
   useEffect(() => {
-    if (authLoading || !token) return;
+    if (authLoading || !isAuthenticated) return;
     if (user && user.role !== "administrator") return;
 
     loadDashboard();
     const interval = setInterval(() => loadDashboard({ background: true }), AUTO_REFRESH_MS);
     return () => clearInterval(interval);
-  }, [authLoading, token, user, loadDashboard]);
+  }, [authLoading, isAuthenticated, user, loadDashboard]);
 
   const formatTime = (iso: string) =>
     new Date(iso).toLocaleString("en-US", {

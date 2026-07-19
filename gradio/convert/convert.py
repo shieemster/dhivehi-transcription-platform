@@ -6,6 +6,7 @@ import requests
 import redis
 import tempfile
 import subprocess
+import threading
 import urllib3
 from datetime import datetime
 from minio import Minio
@@ -232,6 +233,24 @@ def process_file(file_id, minio_url, filename):
         traceback.print_exc()
 
 # =========================
+# Health heartbeat
+# =========================
+
+WORKER_NAME = "convert"
+
+def _heartbeat_loop():
+    # Runs on its own daemon thread, independent of the blpop job loop
+    # below, so a long-running conversion doesn't make this worker look
+    # "down" on the admin health page just because it hasn't returned to
+    # the top of worker_loop() in a while.
+    while True:
+        try:
+            r.set(f"worker_heartbeat:{WORKER_NAME}", str(int(time.time())), ex=30)
+        except Exception:
+            pass
+        time.sleep(10)
+
+# =========================
 # Worker Loop
 # =========================
 
@@ -264,4 +283,5 @@ def worker_loop():
             time.sleep(5)
 
 if __name__ == "__main__":
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
     worker_loop()

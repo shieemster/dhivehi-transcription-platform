@@ -69,13 +69,13 @@ function NewTranscriptPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const jobId = searchParams.get('job_id');
-  const { authFetch, token, isLoading: authLoading } = useAuth();
+  const { authFetch, isAuthenticated, isLoading: authLoading } = useAuth();
 
   useEffect(() => {
-    if (!authLoading && !token) {
+    if (!authLoading && !isAuthenticated) {
       router.push("/login");
     }
-  }, [authLoading, token, router]);
+  }, [authLoading, isAuthenticated, router]);
 
   const [open, setOpen] = useState(false);
   const [category, setCategory] = useState("");

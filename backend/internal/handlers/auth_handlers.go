@@ -13,6 +13,30 @@ import (
 
 const accessTokenTTL = 8 * time.Hour
 
+// setSessionCookie writes the session JWT as an httpOnly, Secure,
+// SameSite=Strict cookie — never readable from JS, and Strict is sufficient
+// CSRF protection here since the frontend and API are different ports of
+// the same host rather than different sites. maxAgeSeconds mirrors the
+// JWT's own TTL so the cookie doesn't outlive the token it carries.
+func setSessionCookie(c *gin.Context, token string, maxAgeSeconds int) {
+	c.SetSameSite(http.SameSiteStrictMode)
+	c.SetCookie(services.SessionCookieName, token, maxAgeSeconds, "/", "", true, true)
+}
+
+// clearSessionCookie expires the session cookie immediately (logout).
+func clearSessionCookie(c *gin.Context) {
+	c.SetSameSite(http.SameSiteStrictMode)
+	c.SetCookie(services.SessionCookieName, "", -1, "/", "", true, true)
+}
+
+// rolesRequiringMFA — administrator and supervisor hold the most sensitive
+// permissions (audit log access, user/role data, deleting transcripts), so
+// MFA isn't optional for them the way it is for everyone else.
+var rolesRequiringMFA = map[string]bool{
+	"administrator": true,
+	"supervisor":    true,
+}
+
 // logLoginFailure records a failed login attempt with no resolved user_id
 // (the attempt may be against an email that doesn't even exist), so these
 // show up in the audit log without a foreign-key user reference. It also
@@ -92,6 +116,34 @@ func Login(c *gin.Context) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid MFA code"})
 			return
 		}
+	} else if rolesRequiringMFA[user.RoleName] {
+		// Correct password, but this role can't get a real session without
+		// MFA enrolled first. Issue a short-lived, restricted token that
+		// only grants access to the enrollment endpoints (see
+		// middleware.RequireFullSession) — enough to let the client walk
+		// straight into enrollment without a second login afterward.
+		enrollToken, err := services.IssueMFAEnrollmentToken(user.ID, user.Email, user.RoleName)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to issue enrollment token"})
+			return
+		}
+		if err := services.LogAudit(c.Request.Context(), &user.ID, user.Email, "login_mfa_enrollment_required", "user", user.ID, c.ClientIP(), nil); err != nil {
+			log.Printf("⚠️ failed to write audit log: %v", err)
+		}
+		services.ResetLoginAttempts(c.Request.Context(), req.Email, c.ClientIP())
+		setSessionCookie(c, enrollToken, int(services.MFAEnrollmentTokenTTL.Seconds()))
+		c.JSON(http.StatusOK, gin.H{
+			"mfa_enrollment_required": true,
+			"expires_in":              int(services.MFAEnrollmentTokenTTL.Seconds()),
+			"user": gin.H{
+				"id":           user.ID,
+				"email":        user.Email,
+				"display_name": user.DisplayName,
+				"role":         user.RoleName,
+				"mfa_enabled":  false,
+			},
+		})
+		return
 	}
 
 	token, err := services.IssueJWT(user.ID, user.Email, user.RoleName, accessTokenTTL)
@@ -105,9 +157,44 @@ func Login(c *gin.Context) {
 	}
 	services.ResetLoginAttempts(c.Request.Context(), req.Email, c.ClientIP())
 
+	setSessionCookie(c, token, int(accessTokenTTL.Seconds()))
 	c.JSON(http.StatusOK, gin.H{
-		"token":      token,
 		"expires_in": int(accessTokenTTL.Seconds()),
+		"user": gin.H{
+			"id":           user.ID,
+			"email":        user.Email,
+			"display_name": user.DisplayName,
+			"role":         user.RoleName,
+			"mfa_enabled":  user.MFAEnabled,
+		},
+	})
+}
+
+// Me handles GET /auth/me. The frontend calls this on load/navigation to
+// positively confirm the httpOnly session cookie is still valid, rather
+// than trusting its locally-cached profile alone — that cache has no way
+// to know the cookie expired naturally, was revoked by a password change,
+// or was invalidated by an admin deactivating/changing the account from
+// somewhere else entirely.
+func Me(c *gin.Context) {
+	claims := c.MustGet("claims").(*services.Claims)
+
+	user, err := services.GetUserByID(c.Request.Context(), claims.UserID)
+	if err != nil {
+		if errors.Is(err, services.ErrUserNotFound) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "session no longer valid"})
+			return
+		}
+		log.Printf("⚠️ failed to fetch current user: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load session"})
+		return
+	}
+	if !user.IsActive {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account is disabled"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
 		"user": gin.H{
 			"id":           user.ID,
 			"email":        user.Email,
@@ -135,6 +222,7 @@ func Logout(c *gin.Context) {
 	if err := services.LogAudit(c.Request.Context(), &claimsTyped.UserID, claimsTyped.Email, "logout", "user", claimsTyped.UserID, c.ClientIP(), nil); err != nil {
 		log.Printf("⚠️ failed to write audit log: %v", err)
 	}
+	clearSessionCookie(c)
 	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
 }
 
@@ -184,7 +272,23 @@ func MFAEnrollConfirm(c *gin.Context) {
 		log.Printf("⚠️ failed to write audit log: %v", err)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "MFA enabled"})
+	// Always issue a fresh full-access token here, not just for the
+	// mandatory-enrollment flow — the caller might currently be holding a
+	// restricted MFAPending token (see middleware.RequireFullSession) and
+	// would otherwise be stuck unable to reach anything else after
+	// enrolling. A voluntary enrollment (already on a full session) simply
+	// gets an equivalent replacement token, which is harmless to ignore.
+	token, err := services.IssueJWT(claims.UserID, claims.Email, claims.RoleName, accessTokenTTL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "MFA enabled, but failed to issue a new session token — please log in again"})
+		return
+	}
+
+	setSessionCookie(c, token, int(accessTokenTTL.Seconds()))
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "MFA enabled",
+		"expires_in": int(accessTokenTTL.Seconds()),
+	})
 }
 
 type changePasswordRequest struct {

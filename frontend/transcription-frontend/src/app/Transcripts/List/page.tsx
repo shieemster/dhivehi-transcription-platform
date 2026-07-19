@@ -74,7 +74,7 @@ interface Transcript {
 
 export default function TranscriptList() {
   const router = useRouter();
-  const { authFetch, token, isLoading: authLoading } = useAuth();
+  const { authFetch, isAuthenticated, isLoading: authLoading } = useAuth();
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -98,16 +98,16 @@ export default function TranscriptList() {
   const fetchingRef = useRef(false);
 
   useEffect(() => {
-    if (!authLoading && !token) {
+    if (!authLoading && !isAuthenticated) {
       router.push("/login");
     }
-  }, [authLoading, token, router]);
+  }, [authLoading, isAuthenticated, router]);
 
   useEffect(() => {
-    if (token) {
+    if (isAuthenticated) {
       fetchTranscripts();
     }
-  }, [token]);
+  }, [isAuthenticated]);
 
   // Debounced content search — the searchQuery box above already filters
   // the already-loaded list by filename/reference number instantly; this
@@ -115,7 +115,7 @@ export default function TranscriptList() {
   // every segment the caller can see, answering "which recording mentioned
   // X" rather than just "which file is named X".
   useEffect(() => {
-    if (!token || searchQuery.trim().length < 2) {
+    if (!isAuthenticated || searchQuery.trim().length < 2) {
       setContentMatches([]);
       return;
     }
@@ -140,7 +140,7 @@ export default function TranscriptList() {
     }, 400);
 
     return () => clearTimeout(handle);
-  }, [token, searchQuery, authFetch]);
+  }, [isAuthenticated, searchQuery, authFetch]);
 
   // The pipeline only ever sets a handful of status strings in practice
   // ("uploaded", "diarized", "transcribed" — see backend/upload.go and the
@@ -155,14 +155,14 @@ export default function TranscriptList() {
   // manual page reload. Silent (no loading spinner) — see fetchTranscripts
   // for the initial/user-triggered load, which does show one.
   useEffect(() => {
-    if (!token) return;
+    if (!isAuthenticated) return;
     if (!transcripts.some(t => isActiveStatus(t.status))) return;
 
     const interval = setInterval(() => {
       fetchTranscripts({ background: true });
     }, 5000);
     return () => clearInterval(interval);
-  }, [token, transcripts]);
+  }, [isAuthenticated, transcripts]);
 
   const fetchTranscripts = async (opts: { background?: boolean } = {}) => {
     if (fetchingRef.current) return;

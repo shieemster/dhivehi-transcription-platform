@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
 import { apiFetch, ApiError } from "@/lib/api";
+import { AdminMenu } from "@/components/AdminMenu";
 import {
   ArrowLeft,
   Moon,
@@ -245,7 +246,10 @@ function AccountPageInner() {
           >
             Account Settings
           </h1>
-          <ThemeToggle />
+          <div className="flex items-center gap-1">
+            {!restrictedSession && <AdminMenu />}
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 

@@ -2,12 +2,26 @@
 import * as React from "react";
 const { useState, useEffect } = React;
 import { useRouter } from "next/navigation";
-import { Card, CardHeader, CardContent } from "@/components/ui/card";
+import { Card, CardHeader, CardContent, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Upload, List, Moon, Sun, Loader2, LogOut, ShieldCheck, UserCog, Users, Activity } from "lucide-react";
+import {
+  Upload,
+  List,
+  Moon,
+  Sun,
+  Loader2,
+  LogOut,
+  UserCog,
+  Clock,
+  Hourglass,
+  CheckCircle2,
+  AlertCircle,
+  RefreshCw,
+} from "lucide-react";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
 import { useTheme } from "next-themes";
+import { AdminMenu } from "@/components/AdminMenu";
 
 // Reads the resolved theme only for the toggle button's own icon/label —
 // guarded by `mounted` (like every other page's ThemeToggle) so it doesn't
@@ -52,10 +66,18 @@ export default function TranscriptionApp() {
   const { user, isAuthenticated, isLoading: authLoading, logout, authFetch } = useAuth();
 
   useEffect(() => {
-    if (!authLoading && !isAuthenticated) {
+    if (authLoading) return;
+    if (!isAuthenticated) {
       router.push("/login");
+      return;
     }
-  }, [authLoading, isAuthenticated, router]);
+    // Administrators get their own dashboard (security summary, user
+    // management, system health) instead of the transcript-focused home
+    // page everyone else lands on.
+    if (user?.role === "administrator") {
+      router.replace("/Admin");
+    }
+  }, [authLoading, isAuthenticated, user, router]);
 
   async function handleLogout() {
     await logout();
@@ -66,55 +88,70 @@ export default function TranscriptionApp() {
   const [pendingTranscriptions, setPendingTranscriptions] = useState(0);
   const [completedTranscriptions, setCompletedTranscriptions] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
   // Fetch stats through the backend (authenticated) — this used to call
   // Qdrant directly from the browser with no login required at all,
   // meaning stats (and the underlying data) were reachable by anyone who
   // could reach the Qdrant port, entirely bypassing RBAC.
-  useEffect(() => {
-    if (!isAuthenticated) return; // wait for session to be restored before fetching
+  const fetchStats = React.useCallback(async (opts: { background?: boolean } = {}) => {
+    if (opts.background) setRefreshing(true); else setLoading(true);
+    try {
+      setError(null);
 
-    const fetchStats = async () => {
-      try {
-        setLoading(true);
-        setError(null);
+      const response = await authFetch(`${BACKEND_URL}/transcripts/stats`);
 
-        const response = await authFetch(`${BACKEND_URL}/transcripts/stats`);
-
-        if (!response.ok) {
-          const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.error || `Failed to fetch stats: ${response.status}`);
-        }
-
-        const stats = await response.json();
-
-        setHoursTranscribed(stats.total_hours ?? 0);
-        setPendingTranscriptions((stats.processing ?? 0) + (stats.uploaded ?? 0));
-        setCompletedTranscriptions(stats.completed ?? 0);
-      } catch (err) {
-        console.error('Error fetching stats:', err);
-        const errorMessage = err instanceof Error ? err.message : 'Failed to fetch stats';
-        setError(errorMessage);
-      } finally {
-        setLoading(false);
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Failed to fetch stats: ${response.status}`);
       }
-    };
+
+      const stats = await response.json();
+
+      setHoursTranscribed(stats.total_hours ?? 0);
+      setPendingTranscriptions((stats.processing ?? 0) + (stats.uploaded ?? 0));
+      setCompletedTranscriptions(stats.completed ?? 0);
+      setLastUpdated(new Date());
+    } catch (err) {
+      console.error('Error fetching stats:', err);
+      const errorMessage = err instanceof Error ? err.message : 'Failed to fetch stats';
+      setError(errorMessage);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, [authFetch]);
+
+  useEffect(() => {
+    if (!isAuthenticated || user?.role === "administrator") return; // wait for session to be restored before fetching; admins get redirected away
 
     fetchStats();
 
     // Refresh stats every 30 seconds
-    const interval = setInterval(fetchStats, 30000);
+    const interval = setInterval(() => fetchStats({ background: true }), 30000);
     return () => clearInterval(interval);
-  }, [isAuthenticated, authFetch]);
+  }, [isAuthenticated, user?.role, fetchStats]);
 
   const handleNavigateToList = () => {
-    window.location.href = "/Transcripts/List";
+    router.push("/Transcripts/List");
   };
 
   const handleNavigateToUpload = () => {
-    window.location.href = "/Transcripts";
+    router.push("/Transcripts");
   };
+
+  // Gates the whole page while auth is resolving, or while an administrator
+  // is being redirected to "/Admin" — otherwise the transcript dashboard
+  // would flash for a moment before the redirect effect fires.
+  if (authLoading || !isAuthenticated || user?.role === "administrator") {
+    return (
+      <div className="min-h-screen bg-stone-200 dark:bg-neutral-900 flex items-center justify-center">
+        <Loader2 className="w-10 h-10 animate-spin text-stone-600 dark:text-neutral-400" />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-stone-200 dark:bg-neutral-900 transition-colors duration-300 ease-in-out">
@@ -130,39 +167,22 @@ export default function TranscriptionApp() {
                 {user.display_name} · <span className="capitalize">{user.role}</span>
               </span>
             )}
-            {user?.role === 'administrator' && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => (window.location.href = "/Security")}
-                title="Security Dashboard"
-                className="transition-all duration-300 ease-in-out hover:scale-110"
-              >
-                <ShieldCheck className="h-5 w-5 text-neutral-700 dark:text-neutral-300" />
-              </Button>
+            {lastUpdated && (
+              <span className="text-xs text-stone-500 dark:text-neutral-400 hidden md:inline">
+                Updated {lastUpdated.toLocaleTimeString()}
+              </span>
             )}
-            {user?.role === 'administrator' && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => (window.location.href = "/Admin/Users")}
-                title="User Management"
-                className="transition-all duration-300 ease-in-out hover:scale-110"
-              >
-                <Users className="h-5 w-5 text-neutral-700 dark:text-neutral-300" />
-              </Button>
-            )}
-            {user?.role === 'administrator' && (
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => (window.location.href = "/Admin/Health")}
-                title="System Health"
-                className="transition-all duration-300 ease-in-out hover:scale-110"
-              >
-                <Activity className="h-5 w-5 text-neutral-700 dark:text-neutral-300" />
-              </Button>
-            )}
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => fetchStats({ background: true })}
+              disabled={refreshing}
+              title="Refresh now"
+              className="transition-all duration-300 ease-in-out hover:scale-110"
+            >
+              <RefreshCw className={`h-5 w-5 text-neutral-700 dark:text-neutral-300 ${refreshing ? "animate-spin" : ""}`} />
+            </Button>
+            <AdminMenu />
             {user && (
               <Button
                 variant="ghost"
@@ -206,18 +226,17 @@ export default function TranscriptionApp() {
 
         {/* Error Message */}
         {error && (
-          <div className="mb-6 p-4 rounded-lg bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">
-            <p className="font-semibold">Error loading stats:</p>
-            <p className="text-sm">{error}</p>
-            <Button
-              onClick={() => window.location.reload()}
-              variant="outline"
-              size="sm"
-              className="mt-2"
-            >
-              Retry
-            </Button>
-          </div>
+          <Card className="shadow-xl bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800 mb-6">
+            <CardContent className="p-6 flex items-center gap-3">
+              <AlertCircle className="w-6 h-6 text-red-600 dark:text-red-400 shrink-0" />
+              <div className="flex-1">
+                <p className="text-red-800 dark:text-red-200">{error}</p>
+              </div>
+              <Button onClick={() => fetchStats()} variant="outline" size="sm">
+                Retry
+              </Button>
+            </CardContent>
+          </Card>
         )}
 
         {/* Stats Cards */}
@@ -227,9 +246,10 @@ export default function TranscriptionApp() {
             onClick={handleNavigateToList}
           >
             <CardHeader>
-              <h3 className="text-lg font-semibold text-stone-900 dark:text-white">
+              <CardTitle className="text-lg text-stone-900 dark:text-white flex items-center gap-2">
+                <Clock className="w-5 h-5" />
                 Hours Transcribed
-              </h3>
+              </CardTitle>
             </CardHeader>
             <CardContent>
               {loading ? (
@@ -247,9 +267,10 @@ export default function TranscriptionApp() {
             onClick={handleNavigateToList}
           >
             <CardHeader>
-              <h3 className="text-lg font-semibold text-stone-900 dark:text-white">
+              <CardTitle className="text-lg text-stone-900 dark:text-white flex items-center gap-2">
+                <Hourglass className="w-5 h-5" />
                 Pending Transcripts
-              </h3>
+              </CardTitle>
             </CardHeader>
             <CardContent>
               {loading ? (
@@ -267,9 +288,10 @@ export default function TranscriptionApp() {
             onClick={handleNavigateToList}
           >
             <CardHeader>
-              <h3 className="text-lg font-semibold text-stone-900 dark:text-white">
+              <CardTitle className="text-lg text-stone-900 dark:text-white flex items-center gap-2">
+                <CheckCircle2 className="w-5 h-5" />
                 Completed Transcriptions
-              </h3>
+              </CardTitle>
             </CardHeader>
             <CardContent>
               {loading ? (

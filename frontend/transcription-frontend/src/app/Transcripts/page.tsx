@@ -1,18 +1,18 @@
 'use client'
 import { Suspense } from 'react'
 import * as React from "react";
-const { useState, useEffect } = React;
+const { useState, useEffect, useRef } = React;
 import { useRouter, useSearchParams } from "next/navigation";
-import { Card, CardHeader, CardContent } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
-import { Slider } from "@/components/ui/slider";
-import { Upload, FileText, X, Moon, Sun, Check, Loader2, AlertCircle } from "lucide-react";
+import { Upload, FileText, X, Moon, Sun, Check, Loader2, AlertCircle, ChevronDown, ChevronUp } from "lucide-react";
 import { useTheme } from "next-themes";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
+import { AdminMenu } from "@/components/AdminMenu";
 
 export default function NewTranscript() {
   return (
@@ -65,6 +65,116 @@ const categories = [
   { value: "other", label: "Other" },
 ];
 
+// Self-contained category combobox — each uploaded file gets its own
+// instance, so the open/search state can't leak between files the way a
+// single shared `open`/`searchValue` pair used to when there was only one
+// set of detail fields for the whole batch.
+function CategoryPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [searchValue, setSearchValue] = useState(() => categories.find(c => c.value === value)?.label ?? "");
+
+  const filteredCategories = categories.filter((cat) =>
+    cat.label.toLowerCase().includes(searchValue.toLowerCase())
+  );
+
+  return (
+    <div className="relative">
+      <Input
+        type="text"
+        placeholder="Type to search categories..."
+        value={searchValue}
+        onChange={(e) => {
+          setSearchValue(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        className="bg-stone-50 dark:bg-neutral-700/50 border-stone-300 dark:border-neutral-600 text-stone-900 dark:text-white placeholder:text-stone-500 dark:placeholder:text-neutral-400 transition-all duration-500 ease-in-out"
+      />
+      {open && filteredCategories.length > 0 && (
+        <div className="absolute z-50 w-full mt-2 rounded-md border bg-white dark:bg-neutral-800 border-neutral-200 dark:border-neutral-700 shadow-md">
+          <div className="max-h-[200px] overflow-y-auto p-1">
+            {filteredCategories.map((cat) => (
+              <div
+                key={cat.value}
+                onMouseDown={(e) => {
+                  // onMouseDown (not onClick) fires before the input's onBlur
+                  // closes the dropdown out from under this click.
+                  e.preventDefault();
+                  onChange(cat.value);
+                  setSearchValue(cat.label);
+                  setOpen(false);
+                }}
+                className="flex items-center px-2 py-1.5 text-sm cursor-pointer rounded-sm text-stone-700 dark:text-neutral-300 hover:bg-stone-100 dark:hover:bg-neutral-700 transition-colors"
+              >
+                <Check
+                  className={`mr-2 h-4 w-4 ${value === cat.value ? "opacity-100" : "opacity-0"}`}
+                />
+                {cat.label}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A row of discrete, individually clickable/draggable blocks rather than a
+// continuous drag handle — speaker count is inherently a small whole number,
+// so this reads at a glance and is harder to mis-set than a fine-grained
+// slider that then gets rounded for display.
+function SegmentedSpeakerSlider({ value, onChange, max = 10 }: { value: number; onChange: (value: number) => void; max?: number }) {
+  const draggingRef = useRef(false);
+
+  useEffect(() => {
+    const stopDragging = () => { draggingRef.current = false; };
+    window.addEventListener("mouseup", stopDragging);
+    window.addEventListener("touchend", stopDragging);
+    return () => {
+      window.removeEventListener("mouseup", stopDragging);
+      window.removeEventListener("touchend", stopDragging);
+    };
+  }, []);
+
+  return (
+    <div className="flex gap-1 w-full select-none">
+      {Array.from({ length: max }, (_, i) => i + 1).map((n) => (
+        <button
+          key={n}
+          type="button"
+          aria-label={`${n} speaker${n > 1 ? "s" : ""}`}
+          aria-pressed={n <= value}
+          onMouseDown={() => {
+            draggingRef.current = true;
+            onChange(n);
+          }}
+          onMouseEnter={() => {
+            if (draggingRef.current) onChange(n);
+          }}
+          className={`flex-1 h-8 rounded-sm transition-colors duration-150 ease-in-out ${n <= value
+            ? "bg-stone-600 dark:bg-neutral-300"
+            : "bg-stone-200 hover:bg-stone-300 dark:bg-neutral-700 dark:hover:bg-neutral-600"
+            }`}
+        />
+      ))}
+    </div>
+  );
+}
+
+interface FileDetail {
+  category: string;
+  referenceNumber: string;
+  notes: string;
+  speakers: number;
+}
+
+const DEFAULT_SPEAKERS = 5;
+
+function defaultFileDetail(): FileDetail {
+  return { category: "", referenceNumber: "", notes: "", speakers: DEFAULT_SPEAKERS };
+}
+
 function NewTranscriptPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -77,13 +187,12 @@ function NewTranscriptPage() {
     }
   }, [authLoading, isAuthenticated, router]);
 
-  const [open, setOpen] = useState(false);
-  const [category, setCategory] = useState("");
-  const [searchValue, setSearchValue] = useState("");
-  const [referenceNumber, setReferenceNumber] = useState("");
-  const [notes, setNotes] = useState("");
-  const [speakers, setSpeakers] = useState([5]);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
+  // Kept in lockstep (by index) with uploadedFiles — each file gets its own
+  // category/reference/notes/speaker count instead of one set of fields
+  // shared across the whole batch.
+  const [fileDetails, setFileDetails] = useState<FileDetail[]>([]);
+  const [expandedIndices, setExpandedIndices] = useState<Set<number>>(new Set());
   type FileStatus = 'pending' | 'uploading' | 'success' | 'error';
   const [fileStatuses, setFileStatuses] = useState<FileStatus[]>([]);
   const [fileErrors, setFileErrors] = useState<(string | null)[]>([]);
@@ -130,15 +239,33 @@ function NewTranscriptPage() {
     }
   }, [notification.show]);
 
-  const filteredCategories = categories.filter((cat) =>
-    cat.label.toLowerCase().includes(searchValue.toLowerCase())
-  );
-
   const addFiles = (files: File[]) => {
     if (files.length === 0) return;
+    const startIndex = uploadedFiles.length;
     setUploadedFiles(prev => [...prev, ...files]);
     setFileStatuses(prev => [...prev, ...files.map(() => 'pending' as FileStatus)]);
     setFileErrors(prev => [...prev, ...files.map(() => null)]);
+    setFileDetails(prev => [...prev, ...files.map(() => defaultFileDetail())]);
+    // Newly-added files start expanded so their fields are immediately
+    // visible/editable — matching how the single set of fields used to
+    // always be visible before this became per-file.
+    setExpandedIndices(prev => {
+      const next = new Set(prev);
+      files.forEach((_, i) => next.add(startIndex + i));
+      return next;
+    });
+  };
+
+  const updateFileDetail = (index: number, patch: Partial<FileDetail>) => {
+    setFileDetails(prev => prev.map((d, i) => (i === index ? { ...d, ...patch } : d)));
+  };
+
+  const toggleExpanded = (index: number) => {
+    setExpandedIndices(prev => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index); else next.add(index);
+      return next;
+    });
   };
 
   const handleDrag = (e: React.DragEvent<HTMLDivElement>) => {
@@ -172,13 +299,23 @@ function NewTranscriptPage() {
     setUploadedFiles(prev => prev.filter((_, i) => i !== index));
     setFileStatuses(prev => prev.filter((_, i) => i !== index));
     setFileErrors(prev => prev.filter((_, i) => i !== index));
+    setFileDetails(prev => prev.filter((_, i) => i !== index));
+    setExpandedIndices(prev => {
+      const next = new Set<number>();
+      prev.forEach(i => {
+        if (i < index) next.add(i);
+        else if (i > index) next.add(i - 1);
+      });
+      return next;
+    });
   };
 
   // Uploads every selected file sequentially (not in parallel) against the
   // existing single-file /upload endpoint — the pipeline's Redis queue
   // processes one conversion job at a time per worker anyway, and
   // sequential uploads make per-file progress easy to show without any
-  // backend changes for batching.
+  // backend changes for batching. Each file's own category/reference
+  // number/notes/speaker count (fileDetails[i]) travels with it.
   const handleSubmit = async () => {
     if (uploadedFiles.length === 0) {
       setNotification({
@@ -196,12 +333,13 @@ function NewTranscriptPage() {
     for (let i = 0; i < uploadedFiles.length; i++) {
       setFileStatuses(prev => prev.map((s, idx) => (idx === i ? 'uploading' : s)));
 
+      const detail = fileDetails[i] ?? defaultFileDetail();
       const formData = new FormData();
       formData.append("file", uploadedFiles[i]);
-      formData.append("category", category);
-      formData.append("reference_number", referenceNumber);
-      formData.append("notes", notes);
-      formData.append("speakers", Math.floor(speakers[0]).toString());
+      formData.append("category", detail.category);
+      formData.append("reference_number", detail.referenceNumber);
+      formData.append("notes", detail.notes);
+      formData.append("speakers", Math.floor(detail.speakers).toString());
 
       try {
         const res = await authFetch(`${BACKEND_URL}/upload`, {
@@ -344,7 +482,10 @@ function NewTranscriptPage() {
             >
               Transcription App
             </h1>
-            <ThemeToggle />
+            <div className="flex items-center gap-1">
+              <AdminMenu />
+              <ThemeToggle />
+            </div>
           </div>
         </header>
 
@@ -362,103 +503,7 @@ function NewTranscriptPage() {
 
           <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700 transition-all duration-500 ease-in-out">
             <CardContent className="p-8 space-y-6 transition-all duration-500 ease-in-out">
-              {/* Category Combobox */}
-              <div className="space-y-2">
-                <Label htmlFor="category" className="text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
-                  Category
-                </Label>
-                <div className="relative">
-                  <Input
-                    type="text"
-                    placeholder="Type to search categories..."
-                    value={searchValue}
-                    onChange={(e) => {
-                      setSearchValue(e.target.value);
-                      setOpen(true);
-                    }}
-                    onFocus={() => setOpen(true)}
-                    className="bg-stone-50 dark:bg-neutral-700/50 border-stone-300 dark:border-neutral-600 text-stone-900 dark:text-white placeholder:text-stone-500 dark:placeholder:text-neutral-400 transition-all duration-500 ease-in-out"
-                  />
-                  {open && filteredCategories.length > 0 && (
-                    <div className="absolute z-50 w-full mt-2 rounded-md border bg-white dark:bg-neutral-800 border-neutral-200 dark:border-neutral-700 shadow-md">
-                      <div className="max-h-[200px] overflow-y-auto p-1">
-                        {filteredCategories.map((cat) => (
-                          <div
-                            key={cat.value}
-                            onClick={() => {
-                              setCategory(cat.value);
-                              setSearchValue(cat.label);
-                              setOpen(false);
-                            }}
-                            className="flex items-center px-2 py-1.5 text-sm cursor-pointer rounded-sm text-stone-700 dark:text-neutral-300 hover:bg-stone-100 dark:hover:bg-neutral-700 transition-colors"
-                          >
-                            <Check
-                              className={`mr-2 h-4 w-4 ${category === cat.value ? "opacity-100" : "opacity-0"}`}
-                            />
-                            {cat.label}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Reference Number */}
-              <div className="space-y-2">
-                <Label htmlFor="reference" className="text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
-                  Reference Number
-                </Label>
-                <Input
-                  id="reference"
-                  type="text"
-                  placeholder="Enter reference number"
-                  value={referenceNumber}
-                  onChange={(e) => setReferenceNumber(e.target.value)}
-                  className="bg-stone-50 dark:bg-neutral-700/50 border-stone-300 dark:border-neutral-600 text-stone-900 dark:text-white placeholder:text-stone-500 dark:placeholder:text-neutral-400 transition-all duration-500 ease-in-out"
-                />
-              </div>
-
-              {/* Additional Notes */}
-              <div className="space-y-2">
-                <Label htmlFor="notes" className="text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
-                  Additional Notes
-                </Label>
-                <Textarea
-                  id="notes"
-                  placeholder="Enter any additional notes..."
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  rows={4}
-                  className="bg-stone-50 dark:bg-neutral-700/50 border-stone-300 dark:border-neutral-600 text-stone-900 dark:text-white placeholder:text-stone-500 dark:placeholder:text-neutral-400 transition-all duration-500 ease-in-out resize-none"
-                />
-              </div>
-
-              {/* Number of Speakers */}
-              <div className="space-y-4">
-                <div className="flex justify-between items-center">
-                  <Label className="text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
-                    Number of Speakers
-                  </Label>
-                  <span className="text-2xl font-bold text-stone-600 dark:text-neutral-300 transition-colors duration-500 ease-in-out">
-                    {Math.round(speakers[0])}
-                  </span>
-                </div>
-                <Slider
-                  value={speakers}
-                  onValueChange={setSpeakers}
-                  max={10}
-                  min={1}
-                  step={0.01}
-                  className="w-full"
-                />
-                <div className="flex justify-between text-xs text-stone-500 dark:text-neutral-400 transition-colors duration-500 ease-in-out">
-                  <span>1</span>
-                  <span>10</span>
-                </div>
-              </div>
-
-              {/* Uploaded Files Display + Upload Area */}
+              {/* Uploaded Files — each gets its own expandable details section */}
               <div className="space-y-2">
                 <Label className="text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
                   Audio/Video File(s) {uploadedFiles.length > 0 && (
@@ -472,40 +517,113 @@ function NewTranscriptPage() {
                   <div className="space-y-2 mb-2">
                     {uploadedFiles.map((file, index) => {
                       const status = fileStatuses[index];
+                      const detail = fileDetails[index] ?? defaultFileDetail();
+                      const isExpanded = expandedIndices.has(index);
                       return (
                         <div
                           key={`${file.name}-${index}`}
-                          className="flex items-center gap-4 p-4 bg-stone-50 dark:bg-neutral-700/50 border border-stone-300 dark:border-neutral-600 rounded-lg transition-all duration-500 ease-in-out"
+                          className="bg-stone-50 dark:bg-neutral-700/50 border border-stone-300 dark:border-neutral-600 rounded-lg transition-all duration-500 ease-in-out overflow-hidden"
                         >
-                          <div className="bg-stone-100 dark:bg-neutral-900/50 p-3 rounded-lg transition-colors duration-500 ease-in-out">
-                            <FileText className="w-6 h-6 text-stone-400 dark:text-neutral-400 transition-colors duration-500 ease-in-out" />
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="font-medium text-stone-900 dark:text-white truncate transition-colors duration-500 ease-in-out">
-                              {file.name}
-                            </p>
-                            <p className="text-sm text-stone-500 dark:text-neutral-400 transition-colors duration-500 ease-in-out">
-                              {(file.size / (1024 * 1024)).toFixed(2)} MB
-                            </p>
-                            {status === 'error' && fileErrors[index] && (
-                              <p className="text-xs text-red-600 dark:text-red-400 flex items-center gap-1 mt-1">
-                                <AlertCircle className="w-3 h-3 shrink-0" />
-                                {fileErrors[index]}
+                          <div className="flex items-center gap-4 p-4">
+                            <div className="bg-stone-100 dark:bg-neutral-900/50 p-3 rounded-lg transition-colors duration-500 ease-in-out">
+                              <FileText className="w-6 h-6 text-stone-400 dark:text-neutral-400 transition-colors duration-500 ease-in-out" />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <p className="font-medium text-stone-900 dark:text-white truncate transition-colors duration-500 ease-in-out">
+                                {file.name}
                               </p>
-                            )}
-                          </div>
-                          {status === 'uploading' && <Loader2 className="w-5 h-5 animate-spin text-stone-500 dark:text-neutral-400" />}
-                          {status === 'success' && <Check className="w-5 h-5 text-green-600 dark:text-green-400" />}
-                          {status === 'error' && <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400" />}
-                          {(status === 'pending' || status === 'error') && (
+                              <p className="text-sm text-stone-500 dark:text-neutral-400 transition-colors duration-500 ease-in-out">
+                                {(file.size / (1024 * 1024)).toFixed(2)} MB
+                              </p>
+                              {status === 'error' && fileErrors[index] && (
+                                <p className="text-xs text-red-600 dark:text-red-400 flex items-center gap-1 mt-1">
+                                  <AlertCircle className="w-3 h-3 shrink-0" />
+                                  {fileErrors[index]}
+                                </p>
+                              )}
+                            </div>
+                            {status === 'uploading' && <Loader2 className="w-5 h-5 animate-spin text-stone-500 dark:text-neutral-400" />}
+                            {status === 'success' && <Check className="w-5 h-5 text-green-600 dark:text-green-400" />}
+                            {status === 'error' && <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400" />}
                             <Button
-                              onClick={() => handleRemoveFile(index)}
+                              type="button"
+                              onClick={() => toggleExpanded(index)}
                               variant="ghost"
                               size="icon"
-                              className="text-stone-600 hover:text-stone-900 dark:text-neutral-400 dark:hover:text-white transition-all duration-500 ease-in-out hover:scale-110"
+                              title={isExpanded ? "Hide details" : "Edit details"}
+                              className="text-stone-600 hover:text-stone-900 dark:text-neutral-400 dark:hover:text-white transition-all duration-500 ease-in-out"
                             >
-                              <X className="w-5 h-5" />
+                              {isExpanded ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
                             </Button>
+                            {(status === 'pending' || status === 'error') && (
+                              <Button
+                                onClick={() => handleRemoveFile(index)}
+                                variant="ghost"
+                                size="icon"
+                                className="text-stone-600 hover:text-stone-900 dark:text-neutral-400 dark:hover:text-white transition-all duration-500 ease-in-out hover:scale-110"
+                              >
+                                <X className="w-5 h-5" />
+                              </Button>
+                            )}
+                          </div>
+
+                          {isExpanded && (
+                            <div className="px-4 pb-4 pt-4 space-y-4 border-t border-stone-300 dark:border-neutral-600">
+                              <div className="space-y-2">
+                                <Label className="text-sm text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
+                                  Category
+                                </Label>
+                                <CategoryPicker
+                                  value={detail.category}
+                                  onChange={(v) => updateFileDetail(index, { category: v })}
+                                />
+                              </div>
+
+                              <div className="space-y-2">
+                                <Label className="text-sm text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
+                                  Reference Number
+                                </Label>
+                                <Input
+                                  type="text"
+                                  placeholder="Enter reference number"
+                                  value={detail.referenceNumber}
+                                  onChange={(e) => updateFileDetail(index, { referenceNumber: e.target.value })}
+                                  className="bg-stone-50 dark:bg-neutral-700/50 border-stone-300 dark:border-neutral-600 text-stone-900 dark:text-white placeholder:text-stone-500 dark:placeholder:text-neutral-400 transition-all duration-500 ease-in-out"
+                                />
+                              </div>
+
+                              <div className="space-y-2">
+                                <Label className="text-sm text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
+                                  Additional Notes
+                                </Label>
+                                <Textarea
+                                  placeholder="Enter any additional notes..."
+                                  value={detail.notes}
+                                  onChange={(e) => updateFileDetail(index, { notes: e.target.value })}
+                                  rows={3}
+                                  className="bg-stone-50 dark:bg-neutral-700/50 border-stone-300 dark:border-neutral-600 text-stone-900 dark:text-white placeholder:text-stone-500 dark:placeholder:text-neutral-400 transition-all duration-500 ease-in-out resize-none"
+                                />
+                              </div>
+
+                              <div className="space-y-3">
+                                <div className="flex justify-between items-center">
+                                  <Label className="text-sm text-stone-900 dark:text-white transition-colors duration-500 ease-in-out">
+                                    Number of Speakers
+                                  </Label>
+                                  <span className="text-xl font-bold text-stone-600 dark:text-neutral-300 transition-colors duration-500 ease-in-out">
+                                    {detail.speakers}
+                                  </span>
+                                </div>
+                                <SegmentedSpeakerSlider
+                                  value={detail.speakers}
+                                  onChange={(v) => updateFileDetail(index, { speakers: v })}
+                                />
+                                <div className="flex justify-between text-xs text-stone-500 dark:text-neutral-400 transition-colors duration-500 ease-in-out">
+                                  <span>1</span>
+                                  <span>10</span>
+                                </div>
+                              </div>
+                            </div>
                           )}
                         </div>
                       );

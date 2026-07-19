@@ -10,6 +10,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
 import { apiFetch, ApiError } from "@/lib/api";
+import { AdminMenu } from "@/components/AdminMenu";
 import {
   ArrowLeft,
   Download,
@@ -670,7 +671,10 @@ function TranscriptDetailsPage() {
             <h1 className="text-2xl font-bold text-neutral-700 dark:text-white">
               Transcription App
             </h1>
-            <ThemeToggle />
+            <div className="flex items-center gap-1">
+              <AdminMenu />
+              <ThemeToggle />
+            </div>
           </div>
         </header>
         <main className="max-w-7xl mx-auto px-6 py-6">
@@ -704,7 +708,10 @@ function TranscriptDetailsPage() {
           >
             Transcription App
           </h1>
-          <ThemeToggle />
+          <div className="flex items-center gap-1">
+            <AdminMenu />
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 

@@ -8,7 +8,9 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
+import { AdminMenu } from "@/components/AdminMenu";
 import {
+  ArrowLeft,
   Upload,
   Search,
   Clock,
@@ -346,11 +348,23 @@ export default function TranscriptList() {
           >
             Transcription App
           </h1>
-          <ThemeToggle />
+          <div className="flex items-center gap-1">
+            <AdminMenu />
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-6">
+        <Button
+          onClick={() => router.push('/')}
+          variant="ghost"
+          className="mb-6 text-stone-700 dark:text-neutral-300 hover:text-stone-900 dark:hover:text-white"
+        >
+          <ArrowLeft className="w-4 h-4 mr-2" />
+          Back to Home
+        </Button>
+
         <div className="flex items-center justify-between mb-6">
           <div>
             <h2 className="text-4xl font-bold text-neutral-700 dark:text-white mb-2">

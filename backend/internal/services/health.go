@@ -135,9 +135,24 @@ func RunHealthChecks(ctx context.Context) []HealthCheck {
 // to one user/role — this is an admin-only infra view, unlike the
 // permission-scoped /transcripts/stats endpoint).
 type PipelineStats struct {
-	Total                  int            `json:"total"`
-	ByStatus               map[string]int `json:"by_status"`
-	OldestActiveAgeSeconds *int64         `json:"oldest_active_age_seconds,omitempty"`
+	Total                  int                  `json:"total"`
+	ByStatus               map[string]int       `json:"by_status"`
+	OldestActiveAgeSeconds *int64               `json:"oldest_active_age_seconds,omitempty"`
+	Jobs                   []PipelineJobSummary `json:"jobs"`
+}
+
+// PipelineJobSummary is the minimal per-job detail the health page needs to
+// let an admin see WHICH jobs sit behind a given status count, not just how
+// many — clicking a status badge filters this list client-side rather than
+// requiring a second request.
+type PipelineJobSummary struct {
+	ID              string `json:"id"`
+	Filename        string `json:"filename"`
+	Category        string `json:"category"`
+	ReferenceNumber string `json:"reference_number"`
+	Status          string `json:"status"`
+	Timestamp       string `json:"timestamp"`
+	UploadedBy      string `json:"uploaded_by,omitempty"`
 }
 
 // terminalJobStatuses mirrors the frontend's TERMINAL_STATUSES list
@@ -160,11 +175,20 @@ func GetPipelineStats() (PipelineStats, error) {
 		return PipelineStats{}, err
 	}
 
-	stats := PipelineStats{Total: len(transcripts), ByStatus: map[string]int{}}
+	stats := PipelineStats{Total: len(transcripts), ByStatus: map[string]int{}, Jobs: make([]PipelineJobSummary, 0, len(transcripts))}
 	var oldestActive *time.Time
 
 	for _, t := range transcripts {
 		stats.ByStatus[t.Status]++
+		stats.Jobs = append(stats.Jobs, PipelineJobSummary{
+			ID:              t.ID,
+			Filename:        t.Filename,
+			Category:        t.Category,
+			ReferenceNumber: t.ReferenceNumber,
+			Status:          t.Status,
+			Timestamp:       t.Timestamp,
+			UploadedBy:      t.UploadedBy,
+		})
 		if terminalJobStatuses[t.Status] {
 			continue
 		}

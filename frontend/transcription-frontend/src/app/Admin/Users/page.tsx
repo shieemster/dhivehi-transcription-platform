@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { BACKEND_URL } from "@/config";
 import { useAuth } from "@/contexts/AuthContext";
 import { apiFetch, ApiError } from "@/lib/api";
+import { AdminMenu } from "@/components/AdminMenu";
 import {
   ArrowLeft,
   Moon,
@@ -86,35 +87,39 @@ export default function AdminUsersPage() {
     if (authLoading) return;
     if (!isAuthenticated) {
       router.push("/login");
-      return;
     }
-    if (user && user.role !== "administrator") {
-      router.push("/");
-    }
-  }, [authLoading, isAuthenticated, user, router]);
+  }, [authLoading, isAuthenticated, router]);
 
+  // Deliberately does NOT pre-check `user.role` before calling the API —
+  // the backend's own RBAC middleware is the real enforcement (see
+  // middleware.RequirePermission), and it only gets a chance to see (and
+  // audit-log) a denied attempt if the frontend actually asks it, instead
+  // of quietly redirecting away client-side before any request is sent.
   const loadUsers = useCallback(async () => {
+    setLoading(true);
+    setError(null);
     try {
-      setLoading(true);
-      setError(null);
       const data = await apiFetch<ManagedUser[]>(authFetch, `${BACKEND_URL}/users`);
       setUsers(data ?? []);
+      setLoading(false);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.push("/login");
-        return;
+        return; // stay on the loading spinner — never reveal the page while navigating away
+      }
+      if (err instanceof ApiError && err.status === 403) {
+        router.push("/");
+        return; // same as above
       }
       setError(err instanceof Error ? err.message : "Failed to load users");
-    } finally {
       setLoading(false);
     }
   }, [authFetch, router]);
 
   useEffect(() => {
     if (authLoading || !isAuthenticated) return;
-    if (user && user.role !== "administrator") return;
     loadUsers();
-  }, [authLoading, isAuthenticated, user, loadUsers]);
+  }, [authLoading, isAuthenticated, loadUsers]);
 
   async function handleCreateUser(e: React.FormEvent) {
     e.preventDefault();
@@ -208,7 +213,12 @@ export default function AdminUsersPage() {
     }
   }
 
-  if (authLoading || !isAuthenticated) {
+  // Gates the ENTIRE page, not just the table — loadUsers() only ever
+  // flips `loading` to false on a genuine 200 or a genuine non-auth error;
+  // a 401/403 leaves it stuck on `true` while the redirect it triggered is
+  // in flight, so a non-admin never sees so much as the page header/nav
+  // flash before being sent away.
+  if (authLoading || !isAuthenticated || loading) {
     return (
       <div className="min-h-screen bg-stone-200 dark:bg-neutral-900 flex items-center justify-center">
         <Loader2 className="w-10 h-10 animate-spin text-stone-600 dark:text-neutral-400" />
@@ -222,22 +232,25 @@ export default function AdminUsersPage() {
         <div className="max-w-6xl mx-auto pl-2 pr-6 py-4 flex items-center justify-between gap-2">
           <h1
             className="text-2xl font-bold text-neutral-700 dark:text-white cursor-pointer hover:text-neutral-900 dark:hover:text-neutral-200"
-            onClick={() => router.push("/")}
+            onClick={() => router.push("/Admin")}
           >
             User Management
           </h1>
-          <ThemeToggle />
+          <div className="flex items-center gap-1">
+            <AdminMenu />
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-6 space-y-6">
         <Button
-          onClick={() => router.push("/")}
+          onClick={() => router.push("/Admin")}
           variant="ghost"
           className="text-stone-700 dark:text-neutral-300 hover:text-stone-900 dark:hover:text-white"
         >
           <ArrowLeft className="w-4 h-4 mr-2" />
-          Back to Home
+          Back to Admin Dashboard
         </Button>
 
         <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700">

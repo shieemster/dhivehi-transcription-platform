@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"log"
 	"net/http"
 
 	"transcript_app/backend/internal/services"
@@ -45,6 +46,16 @@ func RequirePermission(codes ...string) gin.HandlerFunc {
 				c.Next()
 				return
 			}
+		}
+
+		// Every RBAC-level denial is worth a record — this is a role that
+		// flatly lacks any of the required permissions, as opposed to
+		// handlers.logAccessDenied's narrower case (some access, just not to
+		// this specific resource). Best-effort: a logging failure shouldn't
+		// change the response the caller gets.
+		if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "access_denied", "route", c.FullPath(), c.ClientIP(),
+			map[string]interface{}{"method": c.Request.Method, "required_permissions": codes}); err != nil {
+			log.Printf("⚠️ failed to write audit log: %v", err)
 		}
 
 		// Deliberately vague — confirms "not allowed" without revealing which

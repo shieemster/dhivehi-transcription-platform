@@ -29,6 +29,7 @@ import { useTheme } from "next-themes";
 import PdfExportModal from "@/components/PdfExportModal";
 import { generateTranscriptPdf, PdfSegmentData } from "@/lib/pdfGenerator";
 import { useAuth } from "@/contexts/AuthContext";
+import { AdminMenu } from "@/components/AdminMenu";
 
 export default function AnalysisPage() {
   return (
@@ -348,7 +349,10 @@ function AnalysisPageContent() {
             <h1 className="text-2xl font-bold text-neutral-700 dark:text-white">
               Transcription App
             </h1>
-            <ThemeToggle />
+            <div className="flex items-center gap-1">
+              <AdminMenu />
+              <ThemeToggle />
+            </div>
           </div>
         </header>
         <main className="max-w-7xl mx-auto px-6 py-6">
@@ -382,7 +386,10 @@ function AnalysisPageContent() {
           >
             Transcription App
           </h1>
-          <ThemeToggle />
+          <div className="flex items-center gap-1">
+            <AdminMenu />
+            <ThemeToggle />
+          </div>
         </div>
       </header>
 

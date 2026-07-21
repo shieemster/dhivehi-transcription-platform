@@ -49,7 +49,7 @@ backend/cmd/backend/server
 backend/cmd/backend/backend
 
 # ML model caches
-models/
+/models/
 *.bin
 *.pt
 *.onnx

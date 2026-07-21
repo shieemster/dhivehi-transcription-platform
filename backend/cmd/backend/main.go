@@ -155,16 +155,24 @@ func main() {
 	// --- Auth routes ---
 	r.POST("/auth/login", handlers.Login)
 
+	// Password recovery for a caller who is, by definition, not currently
+	// logged in — these two have no session requirement at all.
+	r.POST("/auth/forgot-password", handlers.ForgotPassword)
+	r.POST("/auth/reset-password", handlers.ResetPassword)
+
 	authorized := r.Group("/auth")
 	authorized.Use(middleware.RequireAuth())
 	{
 		// Always reachable, even on a restricted MFA-enrollment token — a
 		// user mid-mandatory-enrollment must still be able to back out, and
-		// enrolling is the entire point of that token.
+		// enrolling (or verifying email in that same window) is the entire
+		// point of that token.
 		authorized.POST("/logout", handlers.Logout)
 		authorized.GET("/me", handlers.Me)
 		authorized.POST("/mfa/enroll/start", handlers.MFAEnrollStart)
 		authorized.POST("/mfa/enroll/confirm", handlers.MFAEnrollConfirm)
+		authorized.POST("/verify-email", handlers.VerifyEmail)
+		authorized.POST("/verify-email/resend", handlers.ResendVerificationEmail)
 
 		// Everything else needs a real, fully-authenticated session.
 		authorized.POST("/logout-all", middleware.RequireFullSession(), handlers.LogoutAllSessions)

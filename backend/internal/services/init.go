@@ -74,6 +74,9 @@ func InitializeServices() error {
 		return fmt.Errorf("failed to initialize Redis: %v", err)
 	}
 
+	// SMTP (email verification, password reset) — never fatal, see initEmail.
+	initEmail()
+
 	log.Println("✅ All services initialized successfully")
 	return nil
 }

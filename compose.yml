@@ -164,6 +164,11 @@ services:
       JWT_SECRET: "${JWT_SECRET:-dev_only_insecure_secret_change_me}"
       FRONTEND_ORIGIN: "${FRONTEND_ORIGIN:-https://localhost:3443}"
       GIN_MODE: "release"
+      SMTP_HOST: "${SMTP_HOST:-}"
+      SMTP_PORT: "${SMTP_PORT:-587}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      SMTP_FROM: "${SMTP_FROM:-}"
     volumes:
       - ./minio-certs/public.crt:/app/certs/public.crt:ro
     depends_on:

@@ -10,6 +10,7 @@ export interface AuthUser {
   display_name: string;
   role: string;
   mfa_enabled?: boolean;
+  email_verified?: boolean;
 }
 
 interface LoginResult {
@@ -35,6 +36,9 @@ interface AuthContextValue {
   // backend has already swapped in a fresh full-access session cookie via
   // Set-Cookie on that response, so there's no token for the client to handle.
   completeMfaEnrollment: () => void;
+  // Reflects a successful POST /auth/verify-email locally, same idea as
+  // completeMfaEnrollment above — no new cookie is involved, just the flag.
+  completeEmailVerification: () => void;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -141,6 +145,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const completeEmailVerification = useCallback(() => {
+    setUser(prev => {
+      if (!prev) return prev;
+      const next = { ...prev, email_verified: true };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ user: next }));
+      return next;
+    });
+  }, []);
+
   const logout = useCallback(async () => {
     try {
       await fetch(`${BACKEND_URL}/auth/logout`, {
@@ -168,7 +181,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [persist]);
 
   return (
-    <AuthContext.Provider value={{ isAuthenticated: user !== null, user, isLoading, login, logout, authFetch, completeMfaEnrollment }}>
+    <AuthContext.Provider value={{ isAuthenticated: user !== null, user, isLoading, login, logout, authFetch, completeMfaEnrollment, completeEmailVerification }}>
       {children}
     </AuthContext.Provider>
   );

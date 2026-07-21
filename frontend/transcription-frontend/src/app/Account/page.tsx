@@ -24,6 +24,8 @@ import {
   Loader2,
   Check,
   AlertCircle,
+  Mail,
+  MailCheck,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 
@@ -65,13 +67,61 @@ function AccountPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const mandatoryMfa = searchParams.get('mandatoryMfa') === '1';
-  const { user, isAuthenticated, authFetch, logout, completeMfaEnrollment, isLoading: authLoading } = useAuth();
+  const { user, isAuthenticated, authFetch, logout, completeMfaEnrollment, completeEmailVerification, isLoading: authLoading } = useAuth();
 
   useEffect(() => {
     if (!authLoading && !isAuthenticated) {
       router.push("/login");
     }
   }, [authLoading, isAuthenticated, router]);
+
+  // --- Email verification ---
+  const [emailVerified, setEmailVerified] = useState(user?.email_verified ?? false);
+  const [verifyCode, setVerifyCode] = useState("");
+  const [verifySubmitting, setVerifySubmitting] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [resending, setResending] = useState(false);
+  const [resendMessage, setResendMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEmailVerified(user?.email_verified ?? false);
+  }, [user]);
+
+  async function handleVerifyEmail(e: React.FormEvent) {
+    e.preventDefault();
+    setVerifyError(null);
+    try {
+      setVerifySubmitting(true);
+      await apiFetch(authFetch, `${BACKEND_URL}/auth/verify-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: verifyCode }),
+      });
+      setEmailVerified(true);
+      completeEmailVerification();
+      setVerifyCode("");
+    } catch (err) {
+      setVerifyError(err instanceof Error ? err.message : "Invalid or expired code");
+    } finally {
+      setVerifySubmitting(false);
+    }
+  }
+
+  async function handleResendVerification() {
+    setVerifyError(null);
+    setResendMessage(null);
+    try {
+      setResending(true);
+      const data = await apiFetch<{ message: string }>(authFetch, `${BACKEND_URL}/auth/verify-email/resend`, {
+        method: "POST",
+      });
+      setResendMessage(data.message);
+    } catch (err) {
+      setVerifyError(err instanceof Error ? err.message : "Failed to resend verification code");
+    } finally {
+      setResending(false);
+    }
+  }
 
   // --- Change password ---
   const [currentPassword, setCurrentPassword] = useState("");
@@ -275,11 +325,77 @@ function AccountPageInner() {
 
         {user && (
           <Card className="shadow-lg bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700">
-            <CardContent className="p-4 text-sm text-stone-600 dark:text-neutral-400">
-              Signed in as <span className="font-semibold text-stone-900 dark:text-white">{user.email}</span>{" "}
-              (<span className="capitalize">{user.role}</span>)
+            <CardContent className="p-4 text-sm text-stone-600 dark:text-neutral-400 flex items-center justify-between flex-wrap gap-2">
+              <span>
+                Signed in as <span className="font-semibold text-stone-900 dark:text-white">{user.email}</span>{" "}
+                (<span className="capitalize">{user.role}</span>)
+              </span>
+              {emailVerified ? (
+                <Badge className="bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 flex items-center gap-1">
+                  <MailCheck className="w-3 h-3" />
+                  Email verified
+                </Badge>
+              ) : (
+                <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200 flex items-center gap-1">
+                  <Mail className="w-3 h-3" />
+                  Email unverified
+                </Badge>
+              )}
             </CardContent>
           </Card>
+        )}
+
+        {/* Email verification */}
+        {!emailVerified && (
+        <Card className="shadow-xl bg-stone-100 dark:bg-neutral-800 border-stone-200 dark:border-neutral-700">
+          <CardHeader>
+            <CardTitle className="text-lg text-neutral-900 dark:text-white flex items-center gap-2">
+              <Mail className="w-5 h-5" />
+              Verify Your Email
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleVerifyEmail} className="space-y-3">
+              <p className="text-sm text-stone-600 dark:text-neutral-400">
+                We sent a 6-digit code to <span className="font-semibold text-stone-900 dark:text-white">{user?.email}</span>.
+                Enter it below to verify your address.
+              </p>
+              <div className="space-y-1">
+                <label className="text-sm text-stone-600 dark:text-neutral-400">Verification code</label>
+                <Input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  autoComplete="one-time-code"
+                  value={verifyCode}
+                  onChange={(e) => setVerifyCode(e.target.value)}
+                  required
+                />
+              </div>
+              {resendMessage && (
+                <p className="text-sm text-green-700 dark:text-green-400 flex items-center gap-2">
+                  <Check className="w-4 h-4 shrink-0" />
+                  {resendMessage}
+                </p>
+              )}
+              {verifyError && (
+                <p className="text-sm text-red-700 dark:text-red-400 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  {verifyError}
+                </p>
+              )}
+              <div className="flex gap-2">
+                <Button type="submit" disabled={verifySubmitting}>
+                  {verifySubmitting ? "Verifying…" : "Verify"}
+                </Button>
+                <Button type="button" variant="ghost" onClick={handleResendVerification} disabled={resending}>
+                  {resending ? "Sending…" : "Resend code"}
+                </Button>
+              </div>
+            </form>
+          </CardContent>
+        </Card>
         )}
 
         {/* Change password — hidden during mandatory enrollment, since a

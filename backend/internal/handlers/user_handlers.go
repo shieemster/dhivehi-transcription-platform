@@ -61,6 +61,17 @@ func CreateUserHandler(c *gin.Context) {
 		log.Printf("⚠️ failed to write audit log: %v", err)
 	}
 
+	// Best-effort — a new account is still usable even if this particular
+	// email never lands (e.g. SMTP not configured yet in this environment),
+	// so a delivery failure doesn't block account creation itself. The user
+	// can request a fresh code via POST /auth/verify-email/resend once
+	// they've logged in.
+	if err := services.IssueEmailVerificationCode(c.Request.Context(), user.ID, user.Email); err != nil {
+		log.Printf("⚠️ failed to send verification email to %s: %v", user.Email, err)
+	} else if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "email_verification_sent", "user", user.ID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
 	c.JSON(http.StatusCreated, user)
 }
 

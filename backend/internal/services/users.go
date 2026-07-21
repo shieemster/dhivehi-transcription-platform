@@ -48,11 +48,11 @@ func CreateUser(ctx context.Context, email, displayName, plainPassword, roleName
 	row := DB.QueryRow(ctx, `
 		INSERT INTO users (email, display_name, password_hash, role_id)
 		SELECT $1, $2, $3, roles.id FROM roles WHERE roles.name = $4
-		RETURNING id, email, display_name, role_id, mfa_enabled, is_active, created_at
+		RETURNING id, email, display_name, role_id, mfa_enabled, email_verified, is_active, created_at
 	`, email, displayName, string(hash), roleName)
 
 	var u models.User
-	if err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.MFAEnabled, &u.IsActive, &u.CreatedAt); err != nil {
+	if err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.MFAEnabled, &u.EmailVerified, &u.IsActive, &u.CreatedAt); err != nil {
 		if isUniqueViolation(err) {
 			return nil, ErrEmailTaken
 		}
@@ -73,14 +73,14 @@ func CreateUser(ctx context.Context, email, displayName, plainPassword, roleName
 // password hash or MFA secret.
 func GetUserByID(ctx context.Context, userID string) (*models.User, error) {
 	row := DB.QueryRow(ctx, `
-		SELECT u.id, u.email, u.display_name, u.role_id, r.name, u.mfa_enabled, u.is_active, u.created_at
+		SELECT u.id, u.email, u.display_name, u.role_id, r.name, u.mfa_enabled, u.email_verified, u.is_active, u.created_at
 		FROM users u
 		JOIN roles r ON r.id = u.role_id
 		WHERE u.id = $1
 	`, userID)
 
 	var u models.User
-	if err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.RoleName, &u.MFAEnabled, &u.IsActive, &u.CreatedAt); err != nil {
+	if err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.RoleName, &u.MFAEnabled, &u.EmailVerified, &u.IsActive, &u.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
 		}
@@ -93,7 +93,7 @@ func GetUserByID(ctx context.Context, userID string) (*models.User, error) {
 // user-management screen, oldest first.
 func ListUsers(ctx context.Context) ([]models.User, error) {
 	rows, err := DB.Query(ctx, `
-		SELECT u.id, u.email, u.display_name, u.role_id, r.name, u.mfa_enabled, u.is_active, u.created_at
+		SELECT u.id, u.email, u.display_name, u.role_id, r.name, u.mfa_enabled, u.email_verified, u.is_active, u.created_at
 		FROM users u
 		JOIN roles r ON r.id = u.role_id
 		ORDER BY u.created_at
@@ -106,7 +106,7 @@ func ListUsers(ctx context.Context) ([]models.User, error) {
 	users := []models.User{}
 	for rows.Next() {
 		var u models.User
-		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.RoleName, &u.MFAEnabled, &u.IsActive, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.DisplayName, &u.RoleID, &u.RoleName, &u.MFAEnabled, &u.EmailVerified, &u.IsActive, &u.CreatedAt); err != nil {
 			return nil, fmt.Errorf("failed to scan user: %w", err)
 		}
 		users = append(users, u)
@@ -163,7 +163,7 @@ func UpdateUser(ctx context.Context, userID string, displayName *string, roleNam
 func GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
 	row := DB.QueryRow(ctx, `
 		SELECT u.id, u.email, u.display_name, u.password_hash, u.role_id, r.name,
-		       COALESCE(u.mfa_secret, ''), u.mfa_enabled, u.is_active, u.created_at
+		       COALESCE(u.mfa_secret, ''), u.mfa_enabled, u.email_verified, u.is_active, u.created_at
 		FROM users u
 		JOIN roles r ON r.id = u.role_id
 		WHERE u.email = $1
@@ -171,7 +171,7 @@ func GetUserByEmail(ctx context.Context, email string) (*models.User, error) {
 
 	var u models.User
 	if err := row.Scan(&u.ID, &u.Email, &u.DisplayName, &u.PasswordHash, &u.RoleID, &u.RoleName,
-		&u.MFASecret, &u.MFAEnabled, &u.IsActive, &u.CreatedAt); err != nil {
+		&u.MFASecret, &u.MFAEnabled, &u.EmailVerified, &u.IsActive, &u.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
 		}
@@ -207,6 +207,49 @@ func ChangePassword(ctx context.Context, userID, currentPassword, newPassword st
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(currentPassword)); err != nil {
 		return ErrInvalidCredentials
+	}
+
+	if err := validatePasswordPolicy(newPassword); err != nil {
+		return err
+	}
+
+	newHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash new password: %w", err)
+	}
+
+	if _, err := DB.Exec(ctx, `UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`, string(newHash), userID); err != nil {
+		return fmt.Errorf("failed to update password: %w", err)
+	}
+
+	return InvalidateAllSessions(ctx, userID)
+}
+
+// IssuePasswordResetCode generates and emails a password-reset code for the
+// given (already-known-to-exist) user. Callers should still return the same
+// generic response to the HTTP caller regardless of whether the account
+// exists — see handlers.ForgotPassword — this function is only reached once
+// that check has already happened server-side.
+func IssuePasswordResetCode(ctx context.Context, userID, email string) error {
+	code, err := issueVerificationCode(ctx, purposePasswordReset, userID)
+	if err != nil {
+		return err
+	}
+	body := fmt.Sprintf(
+		"Your Dhivehi Transcription Platform password reset code is: %s\n\n"+
+			"This code expires in 15 minutes. If you didn't request this, you can safely ignore this email — your password will not be changed.",
+		code,
+	)
+	return SendEmail(email, "Reset your password", body)
+}
+
+// ResetPasswordWithCode verifies a password-reset code and, only on
+// success, sets the new password and invalidates every existing session for
+// the account — the same treatment as ChangePassword, since a reset is
+// exactly the scenario (forgotten or compromised credential) that warrants it.
+func ResetPasswordWithCode(ctx context.Context, userID, code, newPassword string) error {
+	if err := consumeVerificationCode(ctx, purposePasswordReset, userID, code); err != nil {
+		return err
 	}
 
 	if err := validatePasswordPolicy(newPassword); err != nil {

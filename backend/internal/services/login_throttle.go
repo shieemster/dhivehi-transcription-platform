@@ -82,3 +82,28 @@ func RecordFailedLogin(ctx context.Context, email, ip string) error {
 func ResetLoginAttempts(ctx context.Context, email, ip string) {
 	RedisClient.Del(ctx, loginAttemptKey("email", email), loginAttemptKey("ip", ip))
 }
+
+const (
+	forgotPasswordWindow  = time.Hour
+	forgotPasswordIPLimit = 10
+)
+
+// CheckForgotPasswordRateLimit guards POST /auth/forgot-password by caller
+// IP (there's no account-lockout equivalent here, since the endpoint must
+// work for a caller who isn't logged in and might not even know if the
+// email they typed is registered) — without this, the endpoint would be an
+// easy way to spam an arbitrary inbox with reset codes, or rack up calls
+// against whatever SMTP provider is configured.
+func CheckForgotPasswordRateLimit(ctx context.Context, ip string) (bool, error) {
+	key := fmt.Sprintf("forgot_password_attempts:%s", ip)
+	count, err := RedisClient.Incr(ctx, key).Result()
+	if err != nil {
+		return false, fmt.Errorf("failed to check forgot-password rate limit: %w", err)
+	}
+	if count == 1 {
+		if err := RedisClient.Expire(ctx, key, forgotPasswordWindow).Err(); err != nil {
+			return false, fmt.Errorf("failed to set forgot-password rate limit TTL: %w", err)
+		}
+	}
+	return count > forgotPasswordIPLimit, nil
+}

@@ -161,11 +161,12 @@ func Login(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"expires_in": int(accessTokenTTL.Seconds()),
 		"user": gin.H{
-			"id":           user.ID,
-			"email":        user.Email,
-			"display_name": user.DisplayName,
-			"role":         user.RoleName,
-			"mfa_enabled":  user.MFAEnabled,
+			"id":             user.ID,
+			"email":          user.Email,
+			"display_name":   user.DisplayName,
+			"role":           user.RoleName,
+			"mfa_enabled":    user.MFAEnabled,
+			"email_verified": user.EmailVerified,
 		},
 	})
 }
@@ -196,11 +197,12 @@ func Me(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"user": gin.H{
-			"id":           user.ID,
-			"email":        user.Email,
-			"display_name": user.DisplayName,
-			"role":         user.RoleName,
-			"mfa_enabled":  user.MFAEnabled,
+			"id":             user.ID,
+			"email":          user.Email,
+			"display_name":   user.DisplayName,
+			"role":           user.RoleName,
+			"mfa_enabled":    user.MFAEnabled,
+			"email_verified": user.EmailVerified,
 		},
 	})
 }
@@ -328,6 +330,169 @@ func ChangePassword(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "password changed — please log in again"})
+}
+
+type verifyEmailRequest struct {
+	Code string `json:"code" binding:"required"`
+}
+
+// VerifyEmail handles POST /auth/verify-email — routed alongside the MFA
+// enroll endpoints under plain RequireAuth (not RequireFullSession), so a
+// brand-new administrator/supervisor account holding a restricted
+// MFA-enrollment token can still verify its email in that same window,
+// before MFA enrollment is even complete.
+func VerifyEmail(c *gin.Context) {
+	claims := c.MustGet("claims").(*services.Claims)
+
+	var req verifyEmailRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code is required"})
+		return
+	}
+
+	if err := services.VerifyEmailCode(c.Request.Context(), claims.UserID, req.Code); err != nil {
+		switch {
+		case errors.Is(err, services.ErrInvalidVerificationCode), errors.Is(err, services.ErrTooManyVerificationAttempts):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			log.Printf("⚠️ verify email error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to verify email"})
+		}
+		return
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "email_verified", "user", claims.UserID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "email verified"})
+}
+
+// ResendVerificationEmail handles POST /auth/verify-email/resend — issues
+// and sends a fresh code, replacing any previous one, subject to a short
+// cooldown (see services.issueVerificationCode) so a caller can't hammer
+// this into spamming their own inbox or the configured SMTP provider.
+func ResendVerificationEmail(c *gin.Context) {
+	claims := c.MustGet("claims").(*services.Claims)
+
+	if err := services.IssueEmailVerificationCode(c.Request.Context(), claims.UserID, claims.Email); err != nil {
+		switch {
+		case errors.Is(err, services.ErrResendTooSoon):
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
+		case errors.Is(err, services.ErrEmailNotConfigured):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "email delivery is not configured — contact an administrator"})
+		default:
+			log.Printf("⚠️ failed to send verification email: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to send verification email"})
+		}
+		return
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &claims.UserID, claims.Email, "email_verification_sent", "user", claims.UserID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "verification code sent"})
+}
+
+type forgotPasswordRequest struct {
+	Email string `json:"email" binding:"required"`
+}
+
+// ForgotPassword handles POST /auth/forgot-password — publicly reachable,
+// no session required, since the whole point is recovering an account the
+// caller is currently locked out of. Always returns the same generic
+// response regardless of whether the email is registered, matching Login's
+// "don't leak which emails exist" approach — the real result only shows up
+// as an actual email landing in that inbox (or not).
+func ForgotPassword(c *gin.Context) {
+	var req forgotPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email is required"})
+		return
+	}
+
+	limited, err := services.CheckForgotPasswordRateLimit(c.Request.Context(), c.ClientIP())
+	if err != nil {
+		log.Printf("⚠️ forgot-password rate limit check failed: %v", err)
+	} else if limited {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many password reset requests — please try again later"})
+		return
+	}
+
+	const genericMessage = "If that email is registered, a password reset code has been sent."
+
+	user, err := services.GetUserByEmail(c.Request.Context(), req.Email)
+	if err != nil {
+		if !errors.Is(err, services.ErrUserNotFound) {
+			log.Printf("⚠️ forgot-password lookup error for %s: %v", req.Email, err)
+		}
+		c.JSON(http.StatusOK, gin.H{"message": genericMessage})
+		return
+	}
+	if !user.IsActive {
+		// Deliberately silent — same generic response as any other case, so
+		// probing this endpoint can't be used to discover which accounts are
+		// disabled either.
+		c.JSON(http.StatusOK, gin.H{"message": genericMessage})
+		return
+	}
+
+	if err := services.IssuePasswordResetCode(c.Request.Context(), user.ID, user.Email); err != nil && !errors.Is(err, services.ErrResendTooSoon) {
+		log.Printf("⚠️ failed to send password reset email to %s: %v", user.Email, err)
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &user.ID, user.Email, "password_reset_requested", "user", user.ID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": genericMessage})
+}
+
+type resetPasswordRequest struct {
+	Email       string `json:"email" binding:"required"`
+	Code        string `json:"code" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required"`
+}
+
+// ResetPassword handles POST /auth/reset-password — the other half of the
+// forgot-password flow, also publicly reachable. A wrong email is treated
+// identically to a wrong code (same generic error) so this endpoint can't
+// be used to enumerate registered addresses either.
+func ResetPassword(c *gin.Context) {
+	var req resetPasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "email, code, and new_password are required"})
+		return
+	}
+
+	user, err := services.GetUserByEmail(c.Request.Context(), req.Email)
+	if err != nil {
+		if !errors.Is(err, services.ErrUserNotFound) {
+			log.Printf("⚠️ reset-password lookup error for %s: %v", req.Email, err)
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": services.ErrInvalidVerificationCode.Error()})
+		return
+	}
+
+	if err := services.ResetPasswordWithCode(c.Request.Context(), user.ID, req.Code, req.NewPassword); err != nil {
+		switch {
+		case errors.Is(err, services.ErrInvalidVerificationCode), errors.Is(err, services.ErrTooManyVerificationAttempts):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		case errors.Is(err, services.ErrWeakPassword):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
+			log.Printf("⚠️ reset password error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reset password"})
+		}
+		return
+	}
+
+	if err := services.LogAudit(c.Request.Context(), &user.ID, user.Email, "password_reset_completed", "user", user.ID, c.ClientIP(), nil); err != nil {
+		log.Printf("⚠️ failed to write audit log: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "password reset — please log in with your new password"})
 }
 
 // LogoutAllSessions handles POST /auth/logout-all — a self-service "log out

@@ -89,27 +89,6 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "file_metadata")
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Dagster integration (optional)
-DAGSTER_ENABLED = os.getenv("DAGSTER_ENABLED", "false").lower() == "true"
-DAGSTER_API_URL = os.getenv("DAGSTER_API_URL", "http://dagster:3000")
-
-def log_dagster_event(event_type, asset_key, metadata):
-    """Send event to Dagster for tracking"""
-    if not DAGSTER_ENABLED:
-        return
-    
-    try:
-        import requests
-        payload = {
-            "event_type": event_type,
-            "asset_key": asset_key,
-            "metadata": metadata,
-            "timestamp": datetime.now().isoformat()
-        }
-        requests.post(f"{DAGSTER_API_URL}/events", json=payload, timeout=2)
-    except Exception as e:
-        print(f"⚠️ Failed to log Dagster event: {e}")
-
 # =========================
 # Helper Functions
 # =========================
@@ -358,15 +337,6 @@ def worker_loop():
             if transcription_jobs:
                 push_transcription_jobs(transcription_jobs)
                 print(f"✅ Queued {len(transcription_jobs)} segments for transcription")
-                log_dagster_event(
-                    "file_diarized",
-                    "diarized_files",
-                    {
-                        "file_id": file_id,
-                        "segment_count": len(segments),
-                        "speakers": list(set(s["speaker"] for s in segments))
-                    }
-                )
 
         except Exception as e:
             print(f"⚠️ Error in diarization worker: {e}")

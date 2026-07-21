@@ -115,27 +115,6 @@ def download_from_minio_url(minio_url: str) -> bytes:
         response.close()
         response.release_conn()
 
-#Dagster integration
-DAGSTER_ENABLED = os.getenv("DAGSTER_ENABLED", "false").lower() == "true"
-DAGSTER_API_URL = os.getenv("DAGSTER_API_URL", "http://dagster:3000")
-
-def log_dagster_event(event_type, asset_key, metadata):
-    """Send event to Dagster for tracking"""
-    if not DAGSTER_ENABLED:
-        return
-    
-    try:
-        import requests
-        payload = {
-            "event_type": event_type,
-            "asset_key": asset_key,
-            "metadata": metadata,
-            "timestamp": datetime.now().isoformat()
-        }
-        requests.post(f"{DAGSTER_API_URL}/events", json=payload, timeout=2)
-    except Exception as e:
-        print(f"⚠️ Failed to log Dagster event: {e}")
-
 
 # =========================
 # Load Whisper Model
@@ -448,17 +427,6 @@ def worker_loop():
                 continue
 
             print(f"📝 Transcription complete: {transcription}")
-            log_dagster_event(
-                "segment_transcribed",
-                "transcribed_segments",
-                {
-                    "segment_id": segment_id,
-                    "file_id": file_id,
-                    "speaker": speaker,
-                    "duration": end_time - start_time,
-                    "transcription_length": len(transcription)
-                }
-            )
 
             # Update Qdrant
             print("💾 Updating Qdrant...")
@@ -469,14 +437,6 @@ def worker_loop():
             if check_all_segments_transcribed(file_id):
                 update_parent_status(file_id)
                 print(f"✅ All segments transcribed for parent job {file_id}")
-                log_dagster_event(
-                    "file_fully_transcribed",
-                    "completed_files",
-                    {
-                        "file_id": file_id,
-                        "total_segments": "auto"
-                    }
-                )
             else:
                 print(f"⏳ Still waiting for other segments of parent {file_id}")
 

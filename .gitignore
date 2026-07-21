@@ -77,3 +77,7 @@ gradio/analysis/outputs/
 minio-certs/
 backend-certs/
 *.key
+
+# Report diagrams / local dev config — not part of the app
+docs/diagrams/
+.claude/launch.json

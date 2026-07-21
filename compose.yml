@@ -50,8 +50,8 @@ services:
     # on 6333/6334, which combined with the frontend querying it directly
     # meant anyone who could reach this machine could read (and delete)
     # every transcript with zero login required, bypassing RBAC entirely.
-    # Backend, Dagster, and Gradio all reach it via the internal Docker
-    # network hostname "qdrant:6333" and don't need the host mapping.
+    # Backend and Gradio reach it via the internal Docker network hostname
+    # "qdrant:6333" and don't need the host mapping.
     # If you need to inspect Qdrant directly for debugging, use:
     #   docker compose exec backend curl http://qdrant:6333/collections
     volumes:
@@ -75,8 +75,6 @@ services:
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
       SSE_C_KEY: "${SSE_C_KEY}"
-      DAGSTER_ENABLED: "true"
-      DAGSTER_API_URL: "http://dagster:3000"
     volumes:
       - ./minio-certs/public.crt:/app/certs/public.crt:ro
     networks:
@@ -100,9 +98,6 @@ services:
       MINIO_ACCESS_KEY: "minio"
       MINIO_SECRET_KEY: "minio123"
       SSE_C_KEY: "${SSE_C_KEY}"
-      DAGSTER_ENABLED: "true"
-      DAGSTER_API_URL: "http://dagster:3000"
-
     volumes:
       - ./gradio/diarization/outputs:/app/outputs
       - ./models/pyannote:/root/.cache/huggingface/hub
@@ -130,8 +125,6 @@ services:
       MINIO_SECRET_KEY: "minio123"
       SSE_C_KEY: "${SSE_C_KEY}"
       GEMINI_API_KEY: "${GEMINI_API_KEY}"
-      DAGSTER_ENABLED: "true"
-      DAGSTER_API_URL: "http://dagster:3000"
     volumes:
       - /data/911/911_whisper_model:/app/models
       - ./minio-certs/public.crt:/app/certs/public.crt:ro
@@ -209,29 +202,6 @@ services:
     networks:
       - app_network
 
-  dagster:
-    image: python:3.10-slim
-    container_name: transcript_dagster
-    restart: on-failure:5
-    working_dir: /opt/dagster
-    ports:
-      - "3070:3000" 
-    environment:
-      DAGSTER_HOME: /opt/dagster/dagster_home
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      QDRANT_HOST: http://qdrant:6333
-    volumes:
-      - ./dagster:/opt/dagster/app
-      - dagster_home:/opt/dagster/dagster_home
-    networks:
-      - app_network
-    depends_on:
-      - redis
-      - qdrant
-    command: >
-      sh -c " pip install dagster dagster-webserver dagster-postgres redis requests && dagster dev -h 0.0.0.0 -p 3000 -f /opt/dagster/app/definitions.py "
-
 networks:
   app_network:
     driver: bridge
@@ -239,5 +209,4 @@ networks:
 volumes:
   minio_data:
   qdrant_data:
-  dagster_home:
   postgres_data:
